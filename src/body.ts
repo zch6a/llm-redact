@@ -16,7 +16,7 @@
  */
 import { DETECTOR_BY_ID, secretByKey, type Detector } from './detectors.ts';
 import { activeDetectors, canonicalDetector, redactText, type Hit, type RedactOptions } from './redact.ts';
-import type { Vault } from './vault.ts';
+import type { Restorer, Vault } from './vault.ts';
 
 /** Which API a body belongs to — known from the request path, not guessed from the body. */
 export type Api = 'anthropic' | 'chat' | 'responses' | 'other';
@@ -237,7 +237,17 @@ export function redactRequest(body: unknown, vault: Vault, api: Api, opts: Redac
     }
     return text(s, key);
   };
-  const out = walk(body, visit, '', api === 'other' ? 'loose' : 'envelope');
+  const mode: Mode = api === 'other' ? 'loose' : 'envelope';
+  const mark = vault.knownMark;
+  let out = walk(body, visit, '', mode);
+  // The request taught the vault a value (`DB_PASSWORD=x` in a later message): walk it once more,
+  // so the bare value in an *earlier* message is caught too — the shape of the first request after
+  // a restart. Texts seen in the first walk come from the cache, so this costs little.
+  if (vault.knownSince(mark)?.length !== 0) {
+    hits.length = 0;
+    sawPlaceholder = false;
+    out = walk(body, visit, '', mode);
+  }
   if (sawPlaceholder && opts.note !== false && isObject(out)) addNote(out, api);
   return { body: out, hits };
 }
@@ -311,6 +321,6 @@ const isReasoning = (o: Record<string, unknown>): boolean => isSigned(o) || (typ
  * included. In a known API, `arguments` / `partial_json` of the envelope are JSON text and get
  * JSON-escaped values; a tool's own parameter that happens to be called `arguments` does not.
  */
-export function restoreResponse(body: unknown, vault: Vault, api: Api = 'other'): unknown {
+export function restoreResponse(body: unknown, vault: Restorer, api: Api = 'other'): unknown {
   return walk(body, (s, key, free) => vault.restore(s, JSON_TEXT.has(key) && !free ? jsonEncode : undefined), '', api === 'other' ? 'loose' : 'envelope', 0, isReasoning);
 }

@@ -9,9 +9,15 @@ import { after, before, describe, it } from 'node:test';
 import { gzipSync } from 'node:zlib';
 import { apiFor, parseJson, redactForm, redactRequest, restoreResponse } from '../src/body.ts';
 import { createProxy } from '../src/proxy.ts';
-import { RedactLimitError, redactText } from '../src/redact.ts';
+import { RedactCache, RedactLimitError, redactText } from '../src/redact.ts';
 import { NdjsonRestorer, SseParser, SseRestorer } from '../src/sse.ts';
-import { Vault } from '../src/vault.ts';
+import { Vault, loadKey, writePrivate } from '../src/vault.ts';
+import { readConfigFile } from '../src/cli.ts';
+import { execFileSync, spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Json = Record<string, any>;
@@ -197,6 +203,9 @@ before(async () => {
       res.write(line(ph.slice(20) + ' ok'));
       return res.end(line('', true));
     }
+    // ---- round 4: the "model" says what the test puts in x-reply (a guessed or planted placeholder)
+    if (path === '/r4/badredirect') return res.writeHead(302, { location: 'http://[' }).end();
+    if (path?.startsWith('/r4/say')) return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: String(req.headers['x-id'] ?? 'resp_x'), output_text: String(req.headers['x-reply'] ?? '') }));
     // ---- round 3 (response side)
     const firstPh = /\[\[REDACTED:secret_assignment:[0-9a-f]{8}\]\]/.exec(lastRaw)?.[0] ?? PH.exec(lastRaw)?.[0] ?? '';
     if (path === '/r3/psql') return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: 'm', type: 'message', role: 'assistant', content: [{ type: 'text', text: `Running psql with ${firstPh}.` }] }));
@@ -547,6 +556,11 @@ describe('round 3: values restored once are never sent in clear again', () => {
     const r = redactText('API_TOKEN=Zq8-mW3pL7vT2k\nthen curl -H "X-Key: Zq8-mW3pL7vT2k"', fresh);
     noLeak(r.text, 'Zq8-mW3pL7vT2k');
     noLeak(redactText(JSON.stringify(JSON.stringify({ k: 'Zq8-mW3pL7vT2k' })), fresh).text, 'Zq8-mW3pL7vT2k');
+    // A value with characters an encoding changes is found in its encoded spelling only — the views
+    // are searched for it even when the raw text holds no known value as such.
+    const q = new Vault(Buffer.alloc(32, 33));
+    redactText(`DB_PASSWORD='Qx"7-pL\\2m9z'`, q);
+    noLeak(redactText(JSON.stringify({ log: `connected with Qx"7-pL\\2m9z` }), q).text, 'Qx\\"7-pL\\\\2m9z', 'pL');
     // Short values are not searched for everywhere (they would match ordinary text).
     redactText('PASSWORD=Ab1-x9Q', fresh);
     assert.equal(redactText('Ab1-x9Q is a SKU', fresh).text, 'Ab1-x9Q is a SKU');
@@ -705,5 +719,229 @@ describe('round 3: streams', () => {
     for (let i = 0; i < line.length; i += 1024) out += nd.feed(line.slice(i, i + 1024));
     assert.ok(Date.now() - t0 < 2000, `${Date.now() - t0} ms`);
     assert.equal(out.length, line.length);
+  });
+});
+// ==== Round 4 review: the system over time ======================================================
+
+describe('round 4: remembered values across turns and restarts', () => {
+  const fresh = (n: number, o: ConstructorParameters<typeof Vault>[1] = {}) => new Vault(Buffer.alloc(32, n), o);
+  it('#1 a restored value is not pushed out by a flood of other context-found values', () => {
+    const w = fresh(41);
+    // Turn 1: the password, redacted by its context, is restored in the reply (psql -W <it>).
+    const ph = redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', w).hits[0]!.placeholder;
+    w.restore(`psql -W ${ph}`);
+    // Turn 2: the agent reads an access log — 5,001 bearer tokens, all remembered too.
+    const flood = Array.from({ length: 5001 }, (_, i) => `Authorization: Bearer tok${i}Ab3dEf6hIj9kLm2nOp5q`).join('\n');
+    redactText(flood, w);
+    redactText(flood.replace(/tok/g, 'tak'), w);
+    // Turn 3: the history carries the restored command, bare.
+    noLeak(redactText('psql -W Tr0ub4dor-zq9xK', w).text, 'Tr0ub4dor-zq9xK');
+  });
+  it('#1 a value whose context keeps coming back is kept over newer ones (recency, not first sight)', () => {
+    const w = fresh(40);
+    redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', w);
+    redactText(Array.from({ length: 4999 }, (_, i) => `Authorization: Bearer a${i}Ab3dEf6hIj9kLm2nOp5q`).join('\n'), w);
+    redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', w); // seen again: now the most recent
+    redactText(Array.from({ length: 3 }, (_, i) => `Authorization: Bearer b${i}Ab3dEf6hIj9kLm2nOp5q`).join('\n'), w);
+    // Written bare by the user (not restored), in an encoded form only the known-value pass sees.
+    noLeak(redactText(JSON.stringify(JSON.stringify({ cmd: 'psql -W Tr0ub4dor-zq9xK' })), w).text, 'Tr0ub4dor-zq9xK');
+  });
+  it('#1 a restored value stays fresh too', () => {
+    const w = fresh(42);
+    const ph = redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', w).hits[0]!.placeholder;
+    for (let k = 0; k < 3; k++) {
+      redactText(Array.from({ length: 2600 }, (_, i) => `Authorization: Bearer t${k}x${i}Ab3dEf6hIj9kLm2nOp5q`).join('\n'), w);
+      assert.equal(w.restore(`psql -W ${ph}`), 'psql -W Tr0ub4dor-zq9xK');
+    }
+    noLeak(redactText('psql -W Tr0ub4dor-zq9xK', w).text, 'Tr0ub4dor-zq9xK');
+  });
+  it('#2 after a restart, a remembered value is found where its context is gone (hashes only on disk)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'llm-redact-remember-'));
+    try {
+      const file = join(dir, 'remembered');
+      const before = fresh(43, { rememberFile: file });
+      const ph = redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', before).hits[0]!.placeholder;
+      assert.ok(!readFileSync(file, 'utf8').includes('Tr0ub4dor'), 'no value on disk');
+      const after = fresh(43, { rememberFile: file }); // a restarted proxy, same key
+      const summary = 'Summary: the DB password is Tr0ub4dor-zq9xK; I connected with psql -W Tr0ub4dor-zq9xK.';
+      const r = redactText(summary, after);
+      noLeak(r.text, 'Tr0ub4dor-zq9xK');
+      assert.ok(r.text.includes(ph), 'the same placeholder as before the restart');
+      // Without the file the restarted proxy would not know it.
+      assert.ok(redactText(summary, fresh(43)).text.includes('Tr0ub4dor-zq9xK'));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('#3 a bare value earlier in the request than its context (the first request after a restart)', () => {
+    const body = { model: 'm', max_tokens: 1, messages: [{ role: 'user', content: 'earlier I ran psql -W Tr0ub4dor-zq9xK' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'DB_PASSWORD=Tr0ub4dor-zq9xK' }] };
+    noLeak(JSON.stringify(redactRequest(body, fresh(44), 'anthropic').body), 'Tr0ub4dor-zq9xK');
+  });
+  it('#4 short URL passwords are remembered — as whole words, and not plain words', () => {
+    const w = fresh(45);
+    redactText('postgres://app:s3cr3t@db.internal:5432/x', w);
+    noLeak(redactText('PGPASSWORD=s3cr3t psql -h db', w).text, 's3cr3t');
+    assert.equal(redactText('s3cr3tive is not it', w).text, 's3cr3tive is not it');
+    redactText('postgres://app:hello@db.internal/x', w);
+    assert.equal(redactText('hello world', w).text, 'hello world', 'one character class: not remembered');
+  });
+  it('#5 base64 that hides a secret is replaced whole; other base64 is left alone', () => {
+    const w = fresh(46);
+    redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', w);
+    const basic = Buffer.from('admin:Tr0ub4dor-zq9xK').toString('base64');
+    const r = redactText(`> Authorization: Basic ${basic}`, w);
+    noLeak(r.text, basic);
+    noLeak(redactText(Buffer.from(`${SECRET}\n`).toString('base64'), w).text, Buffer.from(`${SECRET}\n`).toString('base64'));
+    const harmless = Buffer.from('just some ordinary text in base64').toString('base64');
+    assert.equal(redactText(`blob ${harmless}`, w).text, `blob ${harmless}`);
+    const binary = randomBytes(48).toString('base64');
+    assert.equal(redactText(`img ${binary}`, w).text, `img ${binary}`);
+  });
+  it('#6 #7 percent-encoding of any character, shell and Python quoting', () => {
+    const w = fresh(47);
+    redactText("DB_PASSWORD='Tr0ub4dor!zq9#xK'", w);
+    // No name around it: only the percent view can see it (%21 and %23 are not the usual escapes).
+    noLeak(redactText('logged in as Tr0ub4dor%21zq9%23xK', w).text, 'zq9');
+    const q = fresh(48);
+    redactText(`DB_PASSWORD="Tr0ub'4dor-zq9xK"`, q);
+    noLeak(redactText(`+ psql -W 'Tr0ub'\\''4dor-zq9xK'`, q).text, '4dor-zq9xK');
+    noLeak(redactText(`{'pw': 'Tr0ub\\'4dor-zq9xK'}`, q).text, '4dor-zq9xK');
+  });
+  it('#8 a cached result is not reused when a value learned later is in it, in an encoded form', () => {
+    const w = fresh(49);
+    const cache = new RedactCache();
+    const text = 'x'.repeat(1100) + ' connected with Tr0ub4dor&amp;zq9xK';
+    assert.ok(redactText(text, w, { cache }).text.includes('Tr0ub4dor'), 'nothing known yet');
+    redactText('DB_PASSWORD=Tr0ub4dor&zq9xK', w, { cache });
+    noLeak(redactText(text, w, { cache }).text, 'zq9xK');
+  });
+});
+
+describe('round 4: a response restores only its own request', () => {
+  const say = (base: string, reply: string, body: unknown, extra: Record<string, string> = {}) => post(base, '/mock/r4/say', JSON.stringify(body), { 'content-type': 'application/json', 'x-reply': reply, ...extra }).then((r) => r.json() as Promise<{ output_text: string }>);
+  it('#9 a placeholder of another conversation — or a guessed one — is not restored', async () => {
+    const w = new Vault(Buffer.alloc(32, 51));
+    const base = await start({ vault: w });
+    // Session A: its value goes into the shared vault.
+    const a = await say(base, '', { model: 'm', messages: [{ role: 'user', content: `mail ${EMAIL}` }] });
+    assert.equal(a.output_text, '');
+    const phA = w.placeholderFor('email', EMAIL);
+    // Session B asks the model to say A's placeholder.
+    const b = await say(base, `here: ${phA}`, { model: 'm', messages: [{ role: 'user', content: 'hello' }] });
+    assert.equal(b.output_text, `here: ${phA}`, 'not restored for B');
+    // A placeholder planted in a file the agent read is not this request's either.
+    const planted = await say(base, `found ${phA}`, { model: 'm', messages: [{ role: 'user', content: `README says ${phA}` }] });
+    assert.equal(planted.output_text, `found ${phA}`);
+    // Its own placeholder is restored.
+    const own = await say(base, `mail ${phA}`, { model: 'm', messages: [{ role: 'user', content: `mail ${EMAIL}` }] });
+    assert.equal(own.output_text, `mail ${EMAIL}`);
+  });
+  it('#9 Responses API: a request that continues an earlier response may restore its values', async () => {
+    const w = new Vault(Buffer.alloc(32, 52));
+    const base = await start({ vault: w });
+    await post(base, '/mock/v1/responses', JSON.stringify({ model: 'm', input: [{ role: 'user', content: `mail ${EMAIL}` }] }), { 'content-type': 'application/json' });
+    const ph = w.placeholderFor('email', EMAIL);
+    // The first response (id resp_1) answered the request that carried the e-mail.
+    await post(base, '/mock/r4/say/responses', JSON.stringify({ model: 'm', input: [{ role: 'user', content: `mail ${EMAIL}` }] }), { 'content-type': 'application/json', 'x-reply': 'ok', 'x-id': 'resp_1' });
+    const next = (await post(base, '/mock/r4/say/responses', JSON.stringify({ model: 'm', previous_response_id: 'resp_1', input: [{ role: 'user', content: 'go on' }] }), { 'content-type': 'application/json', 'x-reply': `sent to ${ph}` }).then((r) => r.json())) as { output_text: string };
+    assert.equal(next.output_text, `sent to ${EMAIL}`);
+    const other = (await post(base, '/mock/r4/say/responses', JSON.stringify({ model: 'm', previous_response_id: 'resp_unknown', input: [{ role: 'user', content: 'go on' }] }), { 'content-type': 'application/json', 'x-reply': `sent to ${ph}` }).then((r) => r.json())) as { output_text: string };
+    assert.equal(other.output_text, `sent to ${ph}`);
+  });
+  it('#1 a value restored through the proxy survives a flood of other values, and stays redacted', async () => {
+    const w = new Vault(Buffer.alloc(32, 54));
+    const base = await start({ vault: w });
+    const turn1 = { model: 'm', max_tokens: 1, messages: [{ role: 'user', content: 'DB_PASSWORD=Tr0ub4dor-zq9xK' }] };
+    const r1 = (await (await post(base, '/mock/r3/psql', JSON.stringify(turn1), { 'content-type': 'application/json' })).json()) as { content: { text: string }[] };
+    assert.equal(r1.content[0]?.text, 'Running psql with Tr0ub4dor-zq9xK.');
+    // Turn 2 reads an access log: 6,000 bearer tokens. (The password's own context is gone: compacted.)
+    redactText(Array.from({ length: 6000 }, (_, i) => `Authorization: Bearer f${i}Ab3dEf6hIj9kLm2nOp5q`).join('\n'), w);
+    await post(base, '/mock/v1/messages', JSON.stringify({ model: 'm', max_tokens: 1, messages: [{ role: 'user', content: `Summary: ${r1.content[0]?.text}` }] }), { 'content-type': 'application/json' });
+    noLeak(lastRaw, 'Tr0ub4dor-zq9xK');
+  });  it('#11 a scope keeps its values even when the vault forgets them mid-response', () => {
+    const w = new Vault(Buffer.alloc(32, 53), 10);
+    const ph = w.placeholderFor('openai_key', SECRET);
+    const scope = w.scope([ph]);
+    for (let i = 0; i < 50; i++) w.placeholderFor('email', `u${i}@corp-mail.cn`);
+    assert.equal(w.valueOf(ph), undefined);
+    assert.equal(scope.restore(`k=${ph}`), `k=${SECRET}`);
+  });
+  it('#16 the access token never reaches the log', async () => {
+    const lines: string[] = [];
+    const TOKEN = 'fedcba9876543210fedcba9876543210';
+    const base = await start({ token: TOKEN, log: (l) => lines.push(l) });
+    await post(base, `/${TOKEN}/mock/v1/messages`, msg, { 'content-type': 'application/json' });
+    await post(base, `/${TOKEN}/mock/v1/messages`, '{', { 'content-type': 'application/json' });
+    // An internal error (a redirect to a URL that does not parse) is logged with the request's URL.
+    assert.equal((await fetch(`${base}/${TOKEN}/mock/r4/badredirect`)).status, 500);
+    assert.ok(lines.length >= 2);
+    assert.ok(!lines.some((l) => l.includes(TOKEN)), lines.join('\n'));
+  });
+});
+
+describe('round 4: config and key files', () => {
+  const dir = () => mkdtempSync(join(tmpdir(), 'llm-redact-life-'));
+  it('#12 a broken or mistyped config file is an error, not "no settings"', () => {
+    const d = dir();
+    try {
+      const f = join(d, 'config.json');
+      writeFileSync(f, '{ "requireToken": true, }');
+      assert.throws(() => readConfigFile(f, false), /not valid JSON/);
+      writeFileSync(f, '{ "requireToken": "true" }');
+      assert.throws(() => readConfigFile(f, false), /wrong type/);
+      writeFileSync(f, '{ "requireTokn": true }');
+      assert.throws(() => readConfigFile(f, false), /did you mean "requireToken"/);
+      writeFileSync(f, '\uFEFF{ "requireToken": true, "port": 9000 }'.replace('\uFEFF', String.fromCharCode(0xfeff)));
+      assert.deepEqual(readConfigFile(f, false), { requireToken: true, port: 9000 });
+      assert.deepEqual(readConfigFile(join(d, 'missing.json'), false), {});
+      assert.throws(() => readConfigFile(join(d, 'missing.json'), true), /could not read/);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+  it('#15 a key file that is not a key is refused, never overwritten; upper-case hex is a key', () => {
+    const d = dir();
+    try {
+      const f = join(d, 'key');
+      writeFileSync(f, 'not a key\n');
+      assert.throws(() => loadKey(f, () => {}), /is not an llm-redact key/);
+      assert.equal(readFileSync(f, 'utf8'), 'not a key\n');
+      writeFileSync(f, 'AB'.repeat(32) + '\n');
+      assert.deepEqual(loadKey(f, () => {}), Buffer.alloc(32, 0xab));
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+  it('#15 processes starting at once agree on one key', async () => {
+    const d = dir();
+    try {
+      const f = join(d, 'key');
+      const script = `import { loadKey } from ${JSON.stringify(new URL('../src/vault.ts', import.meta.url).href)}; process.stdout.write(loadKey(${JSON.stringify(f)}, () => {}).toString('hex'));`;
+      const run = () => new Promise<string>((resolve) => {
+        const c = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'inherit'] });
+        let out = '';
+        c.stdout.on('data', (x) => (out += x));
+        c.on('close', () => resolve(out));
+      });
+      const keys = await Promise.all([run(), run(), run(), run()]);
+      assert.equal(new Set(keys).size, 1, keys.join(' '));
+      assert.equal(readFileSync(f, 'utf8').trim(), keys[0]);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+  it('#14 rewriting a private file leaves no entry for another account', { skip: process.platform !== 'win32' && 'Windows ACLs' }, () => {
+    const d = dir();
+    try {
+      const f = join(d, 'token');
+      writeFileSync(f, 'old\n');
+      execFileSync('icacls', [f, '/grant', '*S-1-5-32-545:R'], { stdio: 'ignore' }); // BUILTIN\Users, explicitly
+      assert.equal(writePrivate(f, 'new\n'), true);
+      const acl = execFileSync('icacls', [f], { encoding: 'utf8' });
+      assert.equal(acl.split(/\r?\n/).filter((l) => /:\(/.test(l)).length, 1, acl);
+      assert.equal(readFileSync(f, 'utf8'), 'new\n');
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
   });
 });

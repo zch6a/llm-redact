@@ -13,6 +13,7 @@ npm run dev                          # run the proxy from source
 npm test
 npm run check                        # type-check (src, tests) + tests
 npm run smoke                        # the real Claude Code / Codex CLIs against a local mock (if installed)
+npm run soak -- --agents 4 --turns 300   # long sessions on one proxy: leaks, latency, memory over time
 ```
 
 ## Layout
@@ -35,6 +36,8 @@ test/
 scripts/
   smoke.ts      the real CLIs, twice each (direct and through the proxy) against a local mock:
                 no leak, values restored, and the request otherwise byte-identical
+  soak.ts       concurrent agents, hundreds of turns, compaction, restored values in the history:
+                no leak and no placeholder at the client on any turn; latency and live heap over time
 ```
 
 ## Adding a detector

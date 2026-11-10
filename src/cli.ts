@@ -102,19 +102,55 @@ function loadToken(): string {
     // first use
   }
   const t = randomBytes(16).toString('hex');
-  writePrivate(file, t + '\n');
+  const r = writePrivate(file, t + '\n', true);
+  // Another proxy created it at the same moment: both must use the same token.
+  if (r === 'exists') return readFileSync(file, 'utf8').trim();
+  if (!r) console.error(`llm-redact: warning: could not make ${file} readable by you only (icacls failed)`);
   return t;
+}
+
+/** What each config file setting must be. */
+const CONFIG_TYPES: Record<string, (x: unknown) => boolean> = {
+  port: (x) => Number.isInteger(x),
+  upstreams: (x) => typeof x === 'object' && x !== null && !Array.isArray(x) && Object.values(x).every((u) => typeof u === 'string' && /^https?:\/\//.test(u)),
+  disable: (x) => Array.isArray(x) && x.every((s) => typeof s === 'string'),
+  enable: (x) => Array.isArray(x) && x.every((s) => typeof s === 'string'),
+  allow: (x) => Array.isArray(x) && x.every((s) => typeof s === 'string'),
+  note: (x) => typeof x === 'boolean',
+  requireToken: (x) => typeof x === 'boolean',
+  allowUnredacted: (x) => typeof x === 'boolean',
+};
+
+/**
+ * The settings file. A file that exists but is broken is an error, not "no settings": silently
+ * ignoring `{ "requireToken": true, }` (a trailing comma) would turn the token off.
+ */
+export function readConfigFile(file: string, explicit: boolean): Record<string, unknown> {
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    if (explicit || (err as NodeJS.ErrnoException).code !== 'ENOENT') throw new UsageError(`could not read ${file}: ${(err as Error).message}`);
+    return {};
+  }
+  let cfg: unknown;
+  try {
+    cfg = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+  } catch (err) {
+    throw new UsageError(`${file} is not valid JSON (${(err as Error).message}); fix or remove it`);
+  }
+  if (typeof cfg !== 'object' || cfg === null || Array.isArray(cfg)) throw new UsageError(`${file} must hold a JSON object`);
+  for (const [k, x] of Object.entries(cfg)) {
+    const ok = CONFIG_TYPES[k];
+    if (!ok) throw new UsageError(`${file}: unknown setting "${k}"${didYouMean(k, Object.keys(CONFIG_TYPES))}`);
+    if (!ok(x)) throw new UsageError(`${file}: "${k}" has the wrong type (${JSON.stringify(x)})`);
+  }
+  return cfg as Record<string, unknown>;
 }
 
 /** Defaults ← config file ← command line. */
 export function loadConfig(v: Values): Config {
-  const file = v.config ?? join(dirname(defaultKeyPath()), 'config.json');
-  let fileCfg: Record<string, unknown> = {};
-  try {
-    fileCfg = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
-  } catch (err) {
-    if (v.config) throw new UsageError(`could not read ${file}: ${(err as Error).message}`);
-  }
+  const fileCfg = readConfigFile(v.config ?? join(dirname(defaultKeyPath()), 'config.json'), !!v.config);
   const strs = (x: unknown) => (Array.isArray(x) ? x.filter((s): s is string => typeof s === 'string') : []);
   const upstreams = { ...DEFAULT_UPSTREAMS, ...((fileCfg.upstreams as Record<string, string>) ?? {}) };
   for (const u of v.upstream ?? []) {
@@ -134,7 +170,8 @@ export function loadConfig(v: Values): Config {
 
 function cmdStart(v: Values): Promise<number> {
   const cfg = loadConfig(v);
-  const vault = new Vault(loadKey());
+  // Values found by their context are remembered across restarts — as keyed hashes, never values.
+  const vault = new Vault(loadKey(), { rememberFile: join(dirname(defaultKeyPath()), 'remembered') });
   const server = createProxy({ vault, upstreams: cfg.upstreams, redact: cfg.redact, allowUnredacted: cfg.allowUnredacted, ...(cfg.token ? { token: cfg.token } : {}), log: v.quiet ? undefined : (l) => console.log(l) });
   return new Promise((resolveExit) => {
     server.on('error', (err: NodeJS.ErrnoException) => {

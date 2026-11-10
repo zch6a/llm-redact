@@ -234,9 +234,11 @@ const DECODERS: { name: string; test: RegExp; re: RegExp; decode: (m: RegExpExec
     },
   },
   // Percent-encoding (form data, URLs quoted in logs): li.wei%40corp-mail.cn.
-  { name: 'percent', test: /%(?:40|3[aAdD]|2[fF26bB2])/, re: /%([0-9a-fA-F]{2})/g, decode: (m) => String.fromCharCode(parseInt(m[1] as string, 16)) },
+  { name: 'percent', test: /%[0-9a-fA-F]{2}/, re: /%([0-9a-fA-F]{2})/g, decode: (m) => String.fromCharCode(parseInt(m[1] as string, 16)) },
   // CSV doubles the quotes inside a quoted field, {""api_key"":""xyz""}; an empty JSON string "" is not that.
   { name: 'csv', test: /[^"]""[A-Za-z_]/, re: /""/g, decode: () => '"' },
+  // Shell and Python quoting: bash -x prints 'Tr0ub'\''4dor', Python repr 'Tr0ub\'4dor'.
+  { name: 'shell', test: /'\\''|\\'/, re: /'\\''|\\'/g, decode: () => "'" },
 ];
 
 /** Decode one level; undefined when there is nothing to decode. */
@@ -268,7 +270,7 @@ function viewsOf(text: string): View[] {
   const identity = new Int32Array(text.length + 1);
   for (let i = 0; i <= text.length; i++) identity[i] = i;
   const root: View = { text, map: identity };
-  const [json, html, percent, csv] = DECODERS as [(typeof DECODERS)[number], (typeof DECODERS)[number], (typeof DECODERS)[number], (typeof DECODERS)[number]];
+  const [json, html, percent, csv, shell] = DECODERS as (typeof DECODERS)[number][] as [(typeof DECODERS)[number], (typeof DECODERS)[number], (typeof DECODERS)[number], (typeof DECODERS)[number], (typeof DECODERS)[number]];
   const out: View[] = [];
   const j1 = decodeView(root, json);
   if (j1) {
@@ -286,6 +288,8 @@ function viewsOf(text: string): View[] {
   if (p1) out.push(p1);
   const c1 = decodeView(root, csv);
   if (c1) out.push(c1);
+  const s1 = decodeView(root, shell);
+  if (s1) out.push(s1);
   return out;
 }
 
@@ -294,6 +298,8 @@ export function redactText(text: string, vault: Vault, opts: RedactOptions = {})
   const cache = opts.cache && text.length >= RedactCache.MIN ? opts.cache : undefined;
   const cached = cache?.get(text);
   if (cached && cacheValid(cached, text, vault)) return { text: cached.text, hits: cached.hits.map((h) => ({ ...h })) };
+  // After a restart: values remembered as hashes, matched in this text, become known again first.
+  vault.recall(text);
   let mark = vault.knownMark;
   let r = redactUncached(text, vault, opts);
   // This text taught the vault a value (`DB_PASSWORD=x` … `psql -W x`): once more, so the value is
@@ -313,7 +319,7 @@ export function redactText(text: string, vault: Vault, opts: RedactOptions = {})
 function cacheValid(cached: Cached, text: string, vault: Vault): boolean {
   if (!cached.values.every(([label, value], i) => vault.placeholderFor(label, value) === cached.hits[i]?.placeholder)) return false;
   const learned = vault.knownSince(cached.mark);
-  if (!learned || learned.some((v) => text.includes(v))) return false;
+  if (!learned || (learned.length && occursIn(text, learned))) return false;
   cached.mark = vault.knownMark;
   return true;
 }
@@ -322,6 +328,49 @@ interface Replacement extends Span {
   detector: Detector;
   value: string;
   direct: boolean;
+}
+
+/** Does any of `values` occur in `text` — as it is, or in one of its decoded views? */
+function occursIn(text: string, values: string[]): boolean {
+  if (values.some((v) => text.includes(v))) return true;
+  // Inside a base64 token it could be anywhere: recompute rather than decode every token here.
+  if (/[A-Za-z0-9+/_-]{16}/.test(text) && [...text.matchAll(BASE64_TOKEN)].some((m) => looksBase64(m[0]))) return true;
+  // Values made of encoding-proof characters can be in a decoded view only if they are in the text.
+  if (values.every((v) => /^[A-Za-z0-9._~-]+$/.test(v))) return false;
+  return viewsOf(text).some((view) => values.some((v) => view.text.includes(v)));
+}
+
+/** Base64 tokens: 16+ characters in whole groups of 4, standard or URL-safe, at most 64 KB each. */
+const BASE64_TOKEN = /(?<![A-Za-z0-9+/=_-])(?:[A-Za-z0-9+/_-]{4}){4,16384}(?:[A-Za-z0-9+/_-]{2}==|[A-Za-z0-9+/_-]{3}=)?(?![A-Za-z0-9+/=_-])/g;
+const MAX_BASE64_TOKENS = 5_000;
+/** An identifier or a word is not base64: it needs a digit, + / - _ or padding, and both cases. */
+const looksBase64 = (token: string) => /[\d+/=_-]/.test(token) && /[A-Z]/.test(token) && /[a-z]/.test(token);
+
+/**
+ * Secrets inside base64 tokens: each token that decodes to mostly printable text is searched with
+ * every detector (remembered values included); a token that hides one becomes one replacement.
+ */
+function base64Secrets(text: string, detectors: Detector[], allow: Set<string>, taken: Span[]): Replacement[] {
+  if (text.length < 16 || !/[A-Za-z0-9+/_-]{16}/.test(text)) return [];
+  const sorted = [...taken].sort((a, b) => a.start - b.start);
+  const out: Replacement[] = [];
+  let seen = 0;
+  for (const m of text.matchAll(BASE64_TOKEN)) {
+    const token = m[0];
+    if (!looksBase64(token)) continue;
+    if (++seen > MAX_BASE64_TOKENS) break;
+    const start = m.index;
+    const end = start + token.length;
+    if (overlapsAny(sorted, start, end)) continue;
+    const decoded = Buffer.from(token.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    // Mostly printable text, or it was not base64 of text (an image, a hash, an id).
+    const printable = decoded.replace(/[^\x20-\x7e\t\n\r]/g, '').length;
+    if (decoded.length < 8 || printable < decoded.length * 0.9) continue;
+    const hit = findValues(decoded, detectors, allow)[0];
+    if (!hit) continue;
+    out.push({ detector: hit.detector, value: token, start, end, direct: true });
+  }
+  return out;
 }
 
 /** Values the vault learned from their context, as a detector that runs first. */
@@ -337,11 +386,13 @@ function redactUncached(text: string, vault: Vault, opts: RedactOptions): Omit<C
   const allow = new Set(opts.allow ?? []);
   const reps: Replacement[] = findValues(text, detectors, allow).map((f) => ({ ...f, direct: true }));
   // Values visible only once the text is decoded: map their spans back to the original.
-  if (/[\\&"%]/.test(text)) {
+  if (/[\\&"%']/.test(text)) {
     let accepted: Span[] = reps.slice();
+    // Known values made of encoding-proof characters show up in a view only if they show up here.
+    const viewDetectors = known && vault.knownPlain && !reps.some((r) => r.detector === known) ? detectors.slice(1) : detectors;
     for (const view of viewsOf(text)) {
       const extra: Replacement[] = [];
-      for (const f of findValues(view.text, detectors, allow)) {
+      for (const f of findValues(view.text, viewDetectors, allow)) {
         const start = view.map[f.start] as number;
         const end = view.map[f.end] as number;
         if (end <= start || overlapsAny(accepted, start, end)) continue;
@@ -351,6 +402,13 @@ function redactUncached(text: string, vault: Vault, opts: RedactOptions): Omit<C
       reps.push(...extra);
       accepted = mergeSpans(accepted, extra);
     }
+    reps.sort((a, b) => a.start - b.start);
+  }
+  // Base64 that hides a secret (`Authorization: Basic …` printed by curl -v, `echo $KEY | base64`):
+  // the whole token is replaced — the value cannot be cut out of it.
+  const b64 = base64Secrets(text, detectors, allow, reps);
+  if (b64.length) {
+    reps.push(...b64);
     reps.sort((a, b) => a.start - b.start);
   }
   const hits: Hit[] = [];

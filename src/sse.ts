@@ -15,7 +15,7 @@
  */
 import { isSigned, jsonEncode, parseJson, restoreResponse, type Api } from './body.ts';
 import { StreamRestorer } from './stream.ts';
-import type { Vault } from './vault.ts';
+import type { Restorer } from './vault.ts';
 
 export interface Event {
   /** Lines other than data: (event:, id:, retry:, comments), kept as they were. */
@@ -140,7 +140,7 @@ const RESPONSES_END = new Set(['response.completed', 'response.failed', 'respons
 
 /** Rewrites events of one response stream. One instance per HTTP response. */
 export class SseRestorer {
-  private readonly vault: Vault;
+  private readonly vault: Restorer;
   private mode: Mode;
   private readonly restorers = new Map<string, StreamRestorer>();
   /** Anthropic block indexes that are tool calls (their deltas are partial JSON). */
@@ -153,7 +153,7 @@ export class SseRestorer {
   private seqShift = 0;
   private lastSeq = -1;
 
-  constructor(vault: Vault, api: Api) {
+  constructor(vault: Restorer, api: Api) {
     this.vault = vault;
     this.mode = api;
   }
@@ -347,8 +347,12 @@ export class SseRestorer {
   }
 
   // ---- OpenAI Responses ----------------------------------------------------------------------
+  /** The Responses API's id for this response, once an event has said it (for `previous_response_id`). */
+  responseId: string | undefined;
+
   private responses(d: Json, head: string[]): Out[] {
     const t = String(d.type ?? '');
+    if (isObj(d.response) && typeof d.response.id === 'string') this.responseId ??= d.response.id;
     const same = (obj: Json): Out[] => [{ obj, head }];
     const key = (deltaType: string) => `${deltaType}|${String(d.item_id ?? '')}|${String(d.output_index ?? '')}|${String(d.content_index ?? '')}`;
     const stream = RESPONSES_STREAMS[t];
@@ -441,7 +445,7 @@ function pick(o: Json, keys: string[]): Json {
  * them); the rest of each object is restored whole; the line that says `done` gets the held tail.
  */
 export class NdjsonRestorer {
-  private readonly vault: Vault;
+  private readonly vault: Restorer;
   /** The line still arriving, in pieces (joined once, when its newline comes: no rescanning). */
   private parts: string[] = [];
   private pending = 0;
@@ -455,7 +459,7 @@ export class NdjsonRestorer {
     [['thinking'], 't'],
   ];
 
-  constructor(vault: Vault, maxLine = 64 * 1024 * 1024) {
+  constructor(vault: Restorer, maxLine = 64 * 1024 * 1024) {
     this.vault = vault;
     this.maxLine = maxLine;
   }

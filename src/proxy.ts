@@ -109,11 +109,18 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
   const log = opts.log ?? (() => {});
   // One cache per proxy (and so per vault): repeated history is not redacted again every turn.
   const redactOpts = { ...opts.redact, cache: new RedactCache() };
+  /**
+   * What a Responses response could restore, by its id: a request that continues it
+   * (`previous_response_id`) may restore those too — its history lives on the server.
+   */
+  const scopes = new Map<string, Map<string, string>>();
 
   // One request must never take the proxy down (and with it every agent using it).
   const server = createServer((req, res) => {
     handle(req, res).catch((err: unknown) => {
-      log(`${req.method} ${req.url} -> internal error: ${(err as Error)?.message ?? err}`);
+      // Never the URL as it came: with --require-token its first segment is the token.
+      const where = opts.token ? (req.url ?? '').replace(opts.token, '<token>') : req.url;
+      log(`${req.method} ${where} -> internal error: ${(err as Error)?.message ?? err}`);
       if (!res.headersSent) send(res, 500, { error: 'llm-redact internal error' });
       else res.destroy();
     });
@@ -151,6 +158,9 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
     let body: Buffer | undefined;
     let note = '';
     const counts: Record<string, number> = {};
+    // The placeholders this request's redaction produced: the only ones its response may restore.
+    const produced = new Set<string>();
+    let previous: string | undefined;
     try {
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         const raw = await readBody(req, maxBody);
@@ -176,10 +186,13 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
           }
           const r = redactRequest(parsed, opts.vault, api, redactOpts);
           Object.assign(counts, summarize(r.hits));
+          for (const h of r.hits) produced.add(h.placeholder);
+          if (typeof parsed === 'object' && parsed !== null && typeof (parsed as { previous_response_id?: unknown }).previous_response_id === 'string') previous = (parsed as { previous_response_id: string }).previous_response_id;
           body = Buffer.from(JSON.stringify(r.body), 'utf8');
         } else if (/^text\/|x-www-form-urlencoded/.test(type)) {
           const r = /x-www-form-urlencoded/.test(type) ? redactForm(text, opts.vault, redactOpts) : redactText(text, opts.vault, redactOpts);
           Object.assign(counts, summarize(r.hits));
+          for (const h of r.hits) produced.add(h.placeholder);
           body = Buffer.from(r.text, 'utf8');
         } else if (opts.allowUnredacted) {
           body = plain;
@@ -192,6 +205,10 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
       return send(res, status, { error: (err as Error).message });
     }
     for (const [k, n] of Object.entries(counts)) stats.redacted[k] = (stats.redacted[k] ?? 0) + n;
+    // Restores only this request's placeholders, with their values pinned now: no guessed tag, no
+    // placeholder planted in a file the agent read, no other conversation's value — and an eviction
+    // from the vault while the response streams cannot take a value away from it.
+    const scope = opts.vault.scope(produced, previous ? scopes.get(previous) : undefined);
 
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k.toLowerCase()) && v !== undefined) headers[k] = Array.isArray(v) ? v.join(', ') : v;
@@ -236,6 +253,7 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
     }
     const type = upstream.headers.get('content-type') ?? '';
     let outcome: string | undefined;
+    let responseId: string | undefined;
     /** Write, waiting when the client reads slower than the upstream sends (no unbounded buffering). */
     const write = async (s: string | Uint8Array): Promise<void> => {
       if (s.length && !res.write(s)) await once(res, 'drain');
@@ -252,7 +270,7 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
         res.writeHead(upstream.status, outHeaders);
         res.flushHeaders(); // the client sees the stream start now, not with the first complete event
         const parser = new SseParser(maxBody);
-        const restorer = new SseRestorer(opts.vault, api);
+        const restorer = new SseRestorer(scope, api);
         const decoder = new TextDecoder();
         for await (const chunk of upstream.body) {
           for (const e of parser.feed(decoder.decode(chunk, { stream: true }))) for (const o of restorer.transform(e)) await write(serialize(o));
@@ -263,11 +281,12 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
         for (const o of restorer.finish()) await write(serialize(o));
         // An event cut off without its blank line: a client discards it, so it goes out as it was.
         res.end(last.rest);
+        responseId = restorer.responseId;
       } else if (/ndjson|jsonl|json-seq|x-json-stream/i.test(type)) {
         // One JSON object per line (Ollama): restored line by line, as it streams.
         res.writeHead(upstream.status, outHeaders);
         res.flushHeaders();
-        const nd = new NdjsonRestorer(opts.vault, maxBody);
+        const nd = new NdjsonRestorer(scope, maxBody);
         const decoder = new TextDecoder();
         for await (const chunk of upstream.body) await write(nd.feed(decoder.decode(chunk, { stream: true })));
         res.end(nd.feed(decoder.decode()) + nd.end());
@@ -277,13 +296,15 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
         let out: string | Uint8Array = text;
         if (/json/i.test(type) || !type) {
           try {
-            out = JSON.stringify(restoreResponse(parseJson(text), opts.vault, api));
+            const parsed = parseJson(text);
+            out = JSON.stringify(restoreResponse(parsed, scope, api));
+            if (typeof parsed === 'object' && parsed !== null && typeof (parsed as { id?: unknown }).id === 'string') responseId = (parsed as { id: string }).id;
           } catch {
             // Not parseable (or absurdly nested): as it came. A blind text restore could put real
             // values inside signed thinking, or break the JSON. (Untyped and not JSON: raw bytes.)
             out = type ? text : bytes;
           }
-        } else out = opts.vault.restore(text);
+        } else out = scope.restore(text);
         res.writeHead(upstream.status, { ...outHeaders, 'content-length': String(typeof out === 'string' ? Buffer.byteLength(out) : out.length) });
         res.end(out);
       } else {
@@ -295,6 +316,11 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
       outcome = `response refused: ${(err as Error).message}`;
       if (!res.headersSent) send(res, 502, { error: (err as Error).message });
       else res.destroy(err as Error);
+    }
+    // A later request may continue this response (Responses API): keep what it could restore.
+    if (api === 'responses' && responseId && scope.values.size) {
+      scopes.set(responseId, scope.values);
+      if (scopes.size > 1000) scopes.delete(scopes.keys().next().value as string);
     }
     const summary = Object.entries(counts).map(([k, n]) => `${k} x${n}`).join(' ');
     log(`${req.method} /${name}${path} -> ${outcome ?? upstream.status} ${Date.now() - t0}ms${summary ? `  redacted ${summary}` : ''}${note}`);

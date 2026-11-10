@@ -6,7 +6,7 @@
  * still turn into a placeholder, so ordinary text (including "[[wiki links]]" or "a[i]") is not
  * delayed beyond the character that rules it out.
  */
-import type { Vault } from './vault.ts';
+import type { Restorer } from './vault.ts';
 
 const OPEN = '[[REDACTED:';
 /** Longest possible placeholder: "[[REDACTED:" + 40-char label + ":" + 8 hex + "]]". */
@@ -21,10 +21,10 @@ export function couldBePlaceholder(s: string): boolean {
 
 export class StreamRestorer {
   private buf = '';
-  private readonly vault: Vault;
+  private readonly vault: Restorer;
   private readonly encode: (value: string) => string;
   /** `encode` turns a restored value into what the stream carries (e.g. JSON string escaping). */
-  constructor(vault: Vault, encode: (value: string) => string = (v) => v) {
+  constructor(vault: Restorer, encode: (value: string) => string = (v) => v) {
     this.vault = vault;
     this.encode = encode;
   }

@@ -2,6 +2,29 @@
 
 All notable changes are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.5.0] — 2026-11-11
+
+A fourth independent review looked at the system over time — across turns, sessions and restarts — and found 16 problems, all reproduced. All are fixed, each with a test; every fix was undone once in a copy of the code to make sure the suite fails without it. A new soak test runs concurrent agents for hundreds of turns.
+
+### Security
+
+- **A response restores only its own request's placeholders**, with their values pinned when the request was redacted (for the Responses API, also those of the response it continues). Before, any client could get any value in the shared vault restored — by guessing tags (1,000,000 guesses in one request found 6 real addresses), from another session, or through a placeholder planted in a file the agent reads. Pinning also keeps a value restorable when the vault evicts it mid-stream.
+- **Restored values stay remembered.** A value found by its context and restored to the client is kept in a memory of its own, so a flood of other context-found values (an access log with 5,000 bearer tokens) can no longer push it out — after which it went out in clear every turn. Values in use are refreshed whenever they are seen or restored.
+- **Remembered across restarts**, as keyed hashes in a `remembered` file (never values): after a restart a compaction summary holding a restored value — with its context long gone — no longer leaks it.
+- Within one request, a bare value *before* its context is caught (the request is walked again when it taught the vault a value) — the shape of the first request after a restart.
+- Short URL passwords (4–7 characters, mixed classes) are remembered too, matched as whole words.
+- **Base64**: `Authorization: Basic …` from `curl -v`, `echo $KEY | base64` — a base64 token that decodes to text holding a secret (remembered values included) is replaced whole.
+- Percent-encoding of any character, and shell / Python quoting (`'\''`, `\'`), are decoded views now.
+- A cached result is no longer reused when a value learned later appears in it in an encoded form.
+- A broken default `config.json` (a trailing comma) or a mistyped setting (`"requireToken": "true"`) is an error instead of silently turning `--require-token` off.
+- Key and token files: written owner-only before anything is in them, replacing explicit ACL entries too (`icacls /reset`); created atomically (processes starting at once agree on one key); an existing key that does not parse is refused, never overwritten; a warning when the ACL cannot be set; the folder is owner-only when created.
+- The access token no longer appears in the log on an internal error.
+
+### Added
+
+- `npm run soak`: concurrent agents, hundreds of turns, compaction, restored values in the history — no leak and no placeholder at the client on any turn; latency and live heap over time (4 agents × 600 turns: flat latency, ~60 MB live heap).
+- Known-value search skips decoded views when it cannot find anything there (5,000 remembered values: 681 → 549 ms on a cold 6.5 MB request).
+
 ## [0.4.0] — 2026-11-11
 
 A third independent review, of the response side only, found 20 problems (19 reproduced). All are fixed, each with a test; every fix was undone once in a copy of the code to make sure the suite fails without it (24 mutations, all caught). A seeded property test now covers every streamed format.
@@ -37,7 +60,7 @@ A second independent leak review, focused on what 0.2.0 changed, found 20 more p
 
 ### Security
 
-- **Encoded text, any spelling.** Values in decoded views (JSON escapes, HTML entities, percent-encoding, CSV quotes) are now replaced by mapping their span back to the original, instead of re-encoding the value and searching for that spelling — so Go's `&`, .NET's `+` and Python's `ä` escapes no longer hide a value.
+- **Encoded text, any spelling.** Values in decoded views (JSON escapes, HTML entities, percent-encoding, CSV quotes) are now replaced by mapping their span back to the original, instead of re-encoding the value and searching for that spelling — so Go's `\u0026`, .NET's `\u002B` and Python's `\u00e4` escapes no longer hide a value.
 - **Predicted Outputs** (`prediction.content`, the file being rewritten) and **`metadata`** are redacted; they were skipped as settings.
 - **Numbers**: card and phone numbers written as JSON numbers are redacted; tool-call arguments with no string hits are no longer returned untouched when they hold such numbers.
 - **Unknown APIs** (Ollama, Gemini, anything not Anthropic/OpenAI) are walked as data — every string and object key — instead of with the OpenAI/Anthropic structure rules.
