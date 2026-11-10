@@ -1,0 +1,46 @@
+{
+  "name": "llm-redact",
+  "version": "0.1.0",
+  "description": "A local proxy that redacts API keys, tokens and personal data from your AI agent's requests before they leave your machine, and restores them in the responses. Claude Code, Codex, OpenCode, DeepSeek. Zero dependencies.",
+  "keywords": [
+    "llm",
+    "proxy",
+    "redaction",
+    "secrets",
+    "pii",
+    "privacy",
+    "dlp",
+    "claude-code",
+    "codex",
+    "deepseek",
+    "anthropic",
+    "openai",
+    "security"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "llm-redact": "dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "node src/bin.ts",
+    "test": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "check": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run check && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2"
+  }
+}
