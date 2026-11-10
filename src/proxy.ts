@@ -15,9 +15,9 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from 'node:zlib';
-import { apiFor, redactRequest, restoreResponse } from './body.ts';
-import { redactText, summarize, type RedactOptions } from './redact.ts';
-import { SseParser, SseRestorer, serialize } from './sse.ts';
+import { apiFor, jsonEncode, parseJson, redactForm, redactRequest, restoreResponse } from './body.ts';
+import { RedactCache, redactText, summarize, type RedactOptions } from './redact.ts';
+import { NdjsonRestorer, SseParser, SseRestorer, serialize } from './sse.ts';
 import type { Vault } from './vault.ts';
 import { VERSION } from './version.ts';
 
@@ -49,7 +49,7 @@ export interface ProxyStats {
   redacted: Record<string, number>;
 }
 
-const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'content-encoding', 'accept-encoding']);
+const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'content-encoding', 'accept-encoding', 'expect']);
 const LOOPBACK_HOST = /^(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?$/i;
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -94,6 +94,8 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
   const stats: ProxyStats = { requests: 0, redacted: {} };
   const maxBody = opts.maxBody ?? 64 * 1024 * 1024;
   const log = opts.log ?? (() => {});
+  // One cache per proxy (and so per vault): repeated history is not redacted again every turn.
+  const redactOpts = { ...opts.redact, cache: new RedactCache() };
 
   // One request must never take the proxy down (and with it every agent using it).
   const server = createServer((req, res) => {
@@ -141,21 +143,29 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
         const raw = await readBody(req, maxBody);
         const plain = decompress(raw, req.headers['content-encoding'], maxBody);
         const type = (req.headers['content-type'] ?? '').toLowerCase();
+        // Patterns match UTF-8 text; a body in another charset would pass them by unseen.
+        const charset = /;\s*charset="?([^";\s]+)/.exec(type)?.[1];
+        const foreign = !!charset && !/^(utf-?8|us-ascii|ascii)$/.test(charset);
         let text = plain.toString('utf8');
         if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // a BOM is not a reason to skip redaction
         if (!plain.length) body = plain;
-        else if (/json/.test(type) || (!type && /^\s*[{[]/.test(text.slice(0, 64)))) {
+        else if (foreign) {
+          if (!opts.allowUnredacted) throw Object.assign(new Error(`cannot redact a ${charset} body; refusing to forward it (send UTF-8, or start llm-redact with --allow-unredacted)`), { status: 415 });
+          body = plain;
+          note = ` (${charset} body forwarded UNREDACTED: --allow-unredacted)`;
+        } else if (/json/.test(type) || (!type && /^\s*[{[]/.test(text.slice(0, 64)))) {
           let parsed: unknown;
           try {
-            parsed = JSON.parse(text);
-          } catch {
+            parsed = parseJson(text);
+          } catch (err) {
+            if ((err as Error).message.includes('nested deeper')) throw err;
             throw Object.assign(new Error('request body is not valid JSON; llm-redact does not forward what it cannot redact'), { status: 400 });
           }
-          const r = redactRequest(parsed, opts.vault, api, opts.redact);
+          const r = redactRequest(parsed, opts.vault, api, redactOpts);
           Object.assign(counts, summarize(r.hits));
           body = Buffer.from(JSON.stringify(r.body), 'utf8');
         } else if (/^text\/|x-www-form-urlencoded/.test(type)) {
-          const r = redactText(text, opts.vault, opts.redact);
+          const r = /x-www-form-urlencoded/.test(type) ? redactForm(text, opts.vault, redactOpts) : redactText(text, opts.vault, redactOpts);
           Object.assign(counts, summarize(r.hits));
           body = Buffer.from(r.text, 'utf8');
         } else if (opts.allowUnredacted) {
@@ -217,13 +227,21 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
         for (const e of [...parser.feed(decoder.decode()), ...parser.end()]) for (const o of restorer.transform(e)) res.write(serialize(o));
         for (const o of restorer.finish()) res.write(serialize(o));
         res.end();
+      } else if (/ndjson|jsonl|json-seq|x-json-stream/i.test(type) && upstream.body) {
+        // One JSON object per line (Ollama): restored line by line, as it streams.
+        res.writeHead(upstream.status, outHeaders);
+        const nd = new NdjsonRestorer(opts.vault);
+        const decoder = new TextDecoder();
+        for await (const chunk of upstream.body) res.write(nd.feed(decoder.decode(chunk, { stream: true })));
+        res.end(nd.feed(decoder.decode()) + nd.end());
       } else if (/json/i.test(type)) {
         const text = await upstream.text();
         let out = text;
         try {
           out = JSON.stringify(restoreResponse(JSON.parse(text), opts.vault));
         } catch {
-          out = opts.vault.restore(text);
+          // Not parseable after all: restore as JSON text (escaped), so it stays what it claims to be.
+          out = opts.vault.restore(text, jsonEncode);
         }
         res.writeHead(upstream.status, { ...outHeaders, 'content-length': String(Buffer.byteLength(out)) });
         res.end(out);

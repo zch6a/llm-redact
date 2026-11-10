@@ -3,8 +3,9 @@
  *
  * Text and tool-call arguments arrive as many small deltas; a placeholder can be split across any
  * of them. Each text block / tool call gets its own StreamRestorer; what it holds back is emitted
- * when the block, choice or item ends. Thinking and reasoning deltas pass through untouched (they
- * are signed and sent back verbatim next turn).
+ * when the block, choice or item ends. Signed thinking and reasoning (Anthropic thinking, OpenAI
+ * reasoning and its summaries) pass through untouched: they are sent back verbatim next turn.
+ * Unsigned reasoning text (DeepSeek `reasoning_content`) is restored like any text.
  */
 import { jsonEncode, restoreResponse, type Api } from './body.ts';
 import { StreamRestorer } from './stream.ts';
@@ -16,33 +17,58 @@ interface Event {
   data: string | null;
 }
 
-/** Split an SSE byte stream into events, whatever the network chunking (LF or CRLF). */
+/** A blank line: two line ends, each CRLF, LF or a lone CR (all three are valid SSE). */
+const EVENT_END = /(?:\r\n|\r(?!\n)|\n)(?:\r\n|\r(?!\n)|\n)/g;
+
+/** Split an SSE byte stream into events, whatever the network chunking and line endings. */
 export class SseParser {
-  private buf = '';
+  /** An event still arriving, in pieces: joined only once it is complete (a 16 MB event is not re-scanned per chunk). */
+  private parts: string[] = [];
+  /** The last few characters received: an event end can straddle two chunks. */
+  private tail = '';
   feed(chunk: string): Event[] {
-    this.buf += chunk;
-    const out: Event[] = [];
-    for (;;) {
-      const m = /\r?\n\r?\n/.exec(this.buf);
-      if (!m) break;
-      const block = this.buf.slice(0, m.index);
-      this.buf = this.buf.slice(m.index + m[0].length);
-      out.push(parseBlock(block));
+    const window = this.tail + chunk;
+    this.tail = window.slice(-3);
+    if (!new RegExp(EVENT_END.source).test(window) || (window.endsWith('\r') && !hasEndBefore(window, window.length - 1))) {
+      this.parts.push(chunk);
+      return [];
     }
+    this.parts.push(chunk);
+    const buf = this.parts.join('');
+    const out: Event[] = [];
+    const re = new RegExp(EVENT_END.source, 'g');
+    let start = 0;
+    for (let m = re.exec(buf); m; m = re.exec(buf)) {
+      // A CR at the very end may be the first half of a CRLF still on its way.
+      if (m.index + m[0].length === buf.length && buf.endsWith('\r')) break;
+      out.push(parseBlock(buf.slice(start, m.index)));
+      start = m.index + m[0].length;
+    }
+    const rest = buf.slice(start);
+    this.parts = rest ? [rest] : [];
+    this.tail = rest.slice(-3);
     return out;
   }
   /** Whatever is left at the end (a final event without a blank line after it). */
   end(): Event[] {
-    const rest = this.buf;
-    this.buf = '';
-    return rest.trim() ? [parseBlock(rest)] : [];
+    const rest = this.parts.join('');
+    this.parts = [];
+    this.tail = '';
+    return rest.trim() ? [parseBlock(rest.replace(/(?:\r\n|\r|\n)+$/, ''))] : [];
   }
+}
+
+/** Is there a complete event end in `s` ending at or before `limit`? */
+function hasEndBefore(s: string, limit: number): boolean {
+  const re = new RegExp(EVENT_END.source, 'g');
+  for (let m = re.exec(s); m; m = re.exec(s)) if (m.index + m[0].length <= limit) return true;
+  return false;
 }
 
 function parseBlock(block: string): Event {
   const head: string[] = [];
   const data: string[] = [];
-  for (const line of block.split(/\r?\n/)) {
+  for (const line of block.split(/\r\n|\r|\n/)) {
     if (line.startsWith('data:')) data.push(line.slice(line.startsWith('data: ') ? 6 : 5));
     else head.push(line);
   }
@@ -148,6 +174,9 @@ export class SseRestorer {
       const delta = isObj(c.delta) ? { ...c.delta } : null;
       if (delta) {
         if (typeof delta.content === 'string') delta.content = this.restorer(`c${ci}`, false).push(delta.content);
+        // Reasoning text that is not signed (DeepSeek `reasoning_content`, OpenRouter / vLLM `reasoning`).
+        if (typeof delta.reasoning_content === 'string') delta.reasoning_content = this.restorer(`k${ci}`, false).push(delta.reasoning_content);
+        if (typeof delta.reasoning === 'string') delta.reasoning = this.restorer(`g${ci}`, false).push(delta.reasoning);
         // The legacy `function_call` (before tool_calls) streams JSON arguments the same way.
         if (isObj(delta.function_call) && typeof delta.function_call.arguments === 'string') delta.function_call = { ...delta.function_call, arguments: this.restorer(`l${ci}`, true).push(delta.function_call.arguments) };
         if (Array.isArray(delta.tool_calls))
@@ -169,6 +198,10 @@ export class SseRestorer {
   private drainChoice(ci: string, delta: Json): void {
     const text = this.take(`c${ci}`);
     if (text) delta.content = (typeof delta.content === 'string' ? delta.content : '') + text;
+    for (const [p, field] of [['k', 'reasoning_content'], ['g', 'reasoning']] as const) {
+      const tail = this.take(`${p}${ci}`);
+      if (tail) delta[field] = (typeof delta[field] === 'string' ? delta[field] : '') + tail;
+    }
     const legacy = this.take(`l${ci}`);
     if (legacy) delta.function_call = { ...(isObj(delta.function_call) ? delta.function_call : {}), arguments: (isObj(delta.function_call) && typeof delta.function_call.arguments === 'string' ? delta.function_call.arguments : '') + legacy };
     for (const key of [...this.restorers.keys()].filter((k) => k.startsWith(`t${ci}.`) || k.startsWith(`u${ci}.`))) {
@@ -185,7 +218,7 @@ export class SseRestorer {
     if (!this.restorers.size || !this.lastChat) return [];
     const byChoice = new Map<string, Json>();
     for (const key of [...this.restorers.keys()]) {
-      const ci = key.startsWith('c') || key.startsWith('l') ? key.slice(1) : key.slice(1, key.indexOf('.'));
+      const ci = key.includes('.') ? key.slice(1, key.indexOf('.')) : key.slice(1);
       if (!byChoice.has(ci)) byChoice.set(ci, {});
       this.drainChoice(ci, byChoice.get(ci) as Json);
     }
@@ -218,6 +251,9 @@ export class SseRestorer {
       const done = { ...d, arguments: typeof d.arguments === 'string' ? this.vault.restore(d.arguments, jsonEncode) : d.arguments };
       return tail ? [{ head: replaceEvent(head, 'response.function_call_arguments.delta'), data: JSON.stringify({ ...d, type: 'response.function_call_arguments.delta', delta: tail, arguments: undefined }) }, done] : [done];
     }
+    // Reasoning (summaries included) is sent back verbatim with its encrypted content next turn —
+    // and request-side reasoning items are left alone — so a value restored here would go out in clear.
+    if (t.startsWith('response.reasoning')) return [d];
     // Whole objects (items, parts, the final response): restore everything that is not reasoning.
     if ('item' in d || 'part' in d || 'response' in d) return [restoreResponse(d, this.vault) as Json];
     return [d];
@@ -225,7 +261,77 @@ export class SseRestorer {
 
 }
 
-const ANTHROPIC_EVENTS = new Set(['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop', 'ping', 'error']);
+/**
+ * Newline-delimited JSON streams (Ollama's `/api/chat` and `/api/generate`): one object per line.
+ * The streamed text fields keep a restorer across lines (a placeholder can be split between
+ * them); the rest of each object is restored whole; the line that says `done` gets the held tail.
+ */
+export class NdjsonRestorer {
+  private readonly vault: Vault;
+  private buf = '';
+  private readonly restorers = new Map<string, StreamRestorer>();
+  /** Streamed text fields: [object path, restorer key]. */
+  private static readonly FIELDS: [string[], string][] = [
+    [['message', 'content'], 'mc'],
+    [['message', 'thinking'], 'mt'],
+    [['response'], 'r'],
+    [['thinking'], 't'],
+  ];
+
+  constructor(vault: Vault) {
+    this.vault = vault;
+  }
+
+  /** Complete lines out, as text. */
+  feed(chunk: string): string {
+    this.buf += chunk;
+    const nl = this.buf.lastIndexOf('\n');
+    if (nl < 0) return '';
+    const lines = this.buf.slice(0, nl + 1);
+    this.buf = this.buf.slice(nl + 1);
+    return lines.replace(/[^\n]+/g, (l) => this.line(l));
+  }
+
+  end(): string {
+    const rest = this.buf;
+    this.buf = '';
+    return rest ? this.line(rest, true) : '';
+  }
+
+  private line(l: string, last = false): string {
+    let d: unknown;
+    try {
+      d = JSON.parse(l);
+    } catch {
+      return this.vault.restore(l, jsonEncode);
+    }
+    if (!isObj(d)) return this.vault.restore(l, jsonEncode);
+    const done = d.done === true || last;
+    for (const [path, key] of NdjsonRestorer.FIELDS) {
+      let parent = path.length === 1 ? d : isObj(d[path[0] as string]) ? (d[path[0] as string] as Json) : undefined;
+      const field = path[path.length - 1] as string;
+      let r = this.restorers.get(key);
+      if (!parent || typeof parent[field] !== 'string') {
+        // The last line has no such field: the held tail still has to go out.
+        const tail = done && r ? r.flush() : '';
+        if (tail) {
+          if (!parent) d[path[0] as string] = parent = {};
+          parent[field] = tail;
+        }
+        continue;
+      }
+      if (!r) {
+        r = new StreamRestorer(this.vault);
+        this.restorers.set(key, r);
+      }
+      parent[field] = r.push(parent[field] as string) + (done ? r.flush() : '');
+    }
+    if (done) this.restorers.clear();
+    return JSON.stringify(restoreResponse(d, this.vault));
+  }
+}
+
+const ANTHROPIC_EVENTS =new Set(['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop', 'ping', 'error']);
 
 /** Which wire format an event belongs to (for streams on a path we did not recognise). */
 function sniff(d: Json): Api {

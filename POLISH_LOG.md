@@ -44,10 +44,35 @@ Done then: `src/detectors.ts`, `src/vault.ts`, `src/redact.ts`, `src/stream.ts`;
 
 135 tests (was 95).
 
-## Round 2 — backlog
+## Round 2 — done (v0.3.0)
 
-- Second, fresh leak review focused on what round 1 changed (free zones, escaped-text pass, redirect rewrite, token path).
-- Throughput: the escaped-text pass runs detectors again on unescaped views; measure on a 5 MB conversation and cap the cost.
-- `scan --diff`-style output that shows exactly which spans would change in a request body (helps users trust it).
-- Windows: token/key file permissions (mode 600 is ignored on NTFS) — use an ACL or say so.
-- An end-to-end smoke with a real client binary (Claude Code / Codex) pointed at a mock upstream — no tokens spent.
+- [x] **The real CLIs, end to end, no tokens spent** (`scripts/smoke.ts`, `npm run smoke`): Claude Code 2.1.121 and Codex 0.131.0 each run twice against a local mock — directly and through the proxy — with a fake key, a throwaway home and a minimal environment. Checked: the mock never sees the synthetic key or e-mail, the CLI prints the real values, and the proxied request is **byte-for-byte the direct one** once placeholders and the note are undone (tools, system prompt, cache_control, key order). Both pass. What it found:
+  - **Codex sends `127.0.0.1` traffic through the Windows system proxy** (on here, as on many machines in China) and got a 502 from it. `llm-redact env` now prints `NO_PROXY=127.0.0.1,localhost` (merged with an existing `NO_PROXY`); README says why.
+  - The first run inherited the environment and **Claude Code put the git user's real e-mail into the conversation** — llm-redact did replace it (the mock only saw a placeholder), but a test must not touch real identity: the smoke now gets an empty git config and a minimal environment.
+  - The Codex provider block `llm-redact env codex` prints works exactly as printed (the smoke uses that very config).
+  - Per-run values to ignore when comparing: Claude Code's `cch=` billing hash in system block 0 and `metadata.user_id`; Codex's `prompt_cache_key`.
+- [x] **Throughput.** A synthetic 5.3 MB agent conversation (200 tool results of code, logs, JSON in strings) redacts in ~290 ms; the escaped-text pass costs 2.6× the plain scan. Agents re-send the whole history every turn, so the proxy now keeps a bounded LRU cache of results for long texts (≥ 1 KB, 32 M chars in total, in memory only): the next turn takes **3 ms**.
+- [x] **Windows key/token permissions.** `%APPDATA%` here is also readable by a `CodexSandboxUsers` group — "it is in your profile" is not a guarantee. Key and token are now written through `writePrivate`: created empty, inherited ACL replaced by one granting only the current account's SID (`icacls /inheritance:r /grant:r *SID:F`), then filled. Test checks there is exactly one, non-inherited ACL entry (POSIX: mode 600).
+- [x] `test/cli.test.ts`: `env` output (token, NO_PROXY merge, PowerShell, existing gateway), owner-only files, cache equivalence/copies/bounds. 143 tests.
+- [x] **Second independent leak review** (fresh reviewer, focused on round 1's changes): **20 findings, 19 reproduced**, all fixed. The pattern this time: round 1's fixes were right in spirit but each had a hole.
+  - *Re-encode-and-search* for escaped text missed every serializer that escapes differently from `JSON.stringify` (Go `&`, .NET `+`, Python `ä`) — **and was quadratic** (0.8 MB: 13 s). Replaced by decoded views that carry an offset map back to the original: a value is replaced at its span, whatever its spelling; one linear pass. Same mechanism now covers HTML entities, percent-encoding and CSV quotes.
+  - "Leave settings alone" also left `prediction` (Predicted Outputs: the whole file being rewritten) and `metadata` alone. "Leave signed blocks alone" skipped anything merely *called* thinking. "Skip data: URLs / base64" skipped strings that only *started* like one.
+  - The silent caps of round 1 (100k values, 2M attempts) **failed open**: everything after them went out. Now a refusal (413); overlap checks are binary searches instead of a scan (100k values: 9.7 s → 0.3 s).
+  - Placeholders the model wrote, sent back in the next request, were redacted again into nested placeholders — the `]]` guard ran after `trimEnd` had removed the brackets. Placeholders are now pre-taken spans for every detector.
+  - Numbers: never visited (a card number as a JSON number went out), and re-serialising lost precision (`12345678901234567890`) and `__proto__` keys. Now `JSON.parse` with source text + `JSON.rawJSON` keeps every number exactly as written; long integers are checked.
+  - Unknown APIs (Ollama, Gemini) got the Anthropic/OpenAI structure rules — `id`, `name`, `type` skipped — so their tool arguments leaked. Now walked as data.
+  - Also: form bodies (`%40`), UTF-16 text, NDJSON responses broken by raw restore, labels depending on which rule saw a value first (placeholders changed across restarts), reasoning summaries restored in one event but not another, `Expect: 100-continue`, SSE parser rescanning a 16 MB event per chunk (1.9 s → 23 ms) and ignoring CR-only line ends.
+  - Kept deliberately (documented): tool definitions and output schemas, `stop`, `safety_identifier`, signed blocks, binary files.
+- [x] **Mutation check of the regression tests**: each of 15 fixes undone once in a copy of the code; the first run showed **two tests that tested nothing** — a label test passing because the shared vault remembered an earlier label, and a form test passing because the new percent view caught the case on its own path. Both rewritten; now every mutation is caught.
+- [x] Precision corpus after all this: unchanged on external repositories except three real-shaped test tokens under bare `TOKEN` names (now in scope by design); `pass_rate` and f-strings fixed after the first rerun showed them.
+- [x] Smoke with the real Claude Code and Codex after the walker rewrite: both still byte-identical.
+
+167 tests (was 135).
+
+## Round 3 — backlog
+
+- A third review, this time of the response side only (restore paths: SSE per API, NDJSON, JSON fallback) with a fuzzer: random placeholder splits × random event shapes.
+- `scan --diff` for request bodies (show exactly which spans would change).
+- Codex with a ChatGPT login (`requires_openai_auth`, upstream `chatgpt.com/backend-api/codex`) — cannot be checked without a real login, so not claimed yet.
+- Node 22.15 check (JSON.parse with source / rawJSON are feature-detected; verify the fallback path in CI).
+- Memory: the vault grows without bound in a long-running proxy; consider an LRU with the cache's bound (values come back with the next request anyway).

@@ -13,6 +13,7 @@
  * the real values in its history and they are redacted again to the same placeholders.
  */
 import { createHmac, randomBytes } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -63,19 +64,46 @@ export function defaultKeyPath(): string {
   return join(base, 'key');
 }
 
-/** The local HMAC key: created once (32 random bytes), readable only by you on POSIX systems. */
+/** The current Windows account's SID (`S-1-5-21-…`), or undefined. */
+function windowsSid(): string | undefined {
+  try {
+    const out = execFileSync('whoami', ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    return /"(S-1-[\d-]+)"/.exec(out)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write a file only you can read. POSIX: mode 600. Windows ignores modes and a new file inherits its
+ * folder's ACL, which can include other accounts (sandbox groups, shared profiles) — so the file is
+ * created empty, its ACL replaced by "owner only", and only then filled. Returns false when the
+ * Windows ACL could not be set (the file is still written).
+ */
+export function writePrivate(path: string, content: string): boolean {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, '', { mode: 0o600 });
+  let ok = true;
+  if (process.platform === 'win32') {
+    const sid = windowsSid();
+    try {
+      if (!sid) throw new Error('no SID');
+      execFileSync('icacls', [path, '/inheritance:r', '/grant:r', `*${sid}:F`], { windowsHide: true, stdio: 'ignore' });
+    } catch {
+      ok = false;
+    }
+  } else chmodSync(path, 0o600);
+  writeFileSync(path, content);
+  return ok;
+}
+
+/** The local HMAC key: created once (32 random bytes), readable only by you. */
 export function loadKey(path = defaultKeyPath()): Buffer {
   if (existsSync(path)) {
     const hex = readFileSync(path, 'utf8').trim();
     if (/^[0-9a-f]{64}$/.test(hex)) return Buffer.from(hex, 'hex');
   }
   const key = randomBytes(32);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, key.toString('hex') + '\n', { mode: 0o600 });
-  try {
-    chmodSync(path, 0o600);
-  } catch {
-    // Windows: ACLs, not modes; the file lives in the user's own profile.
-  }
+  writePrivate(path, key.toString('hex') + '\n');
   return key;
 }

@@ -67,7 +67,11 @@ Then point your agent at it:
 
 Already using a gateway or relay? Chain it: `llm-redact --upstream anthropic=https://your-gateway`. `llm-redact env` notices an existing `ANTHROPIC_BASE_URL` and prints exactly that line.
 
+Behind an HTTP proxy (`HTTPS_PROXY`, or a system-wide proxy — Codex uses the Windows one even for `127.0.0.1`)? Requests to llm-redact must bypass it, or they get a 502 from it: `llm-redact env` also prints `NO_PROXY=127.0.0.1,localhost`, keeping whatever your `NO_PROXY` already had.
+
 Your API key travels in headers, untouched — the provider needs it. Only request bodies are redacted.
+
+Tested end to end with the real **Claude Code 2.1** and **Codex 0.131** CLIs (`npm run smoke`, against a local mock: no tokens spent). Each sends a synthetic key and e-mail; the mock sees only placeholders, the CLI prints the real values, and the proxied request is byte-for-byte what the CLI sent directly once placeholders and the note are undone.
 
 ## What is detected
 
@@ -86,12 +90,15 @@ Measured, not assumed: over 2,955 real files (five popular public skill reposito
 - **Stable placeholders.** `[[REDACTED:openai_key:a3aec50a]]` — the tag is an HMAC of the value with a random key created on first run (`~/.config/llm-redact/key`, or `%APPDATA%\llm-redact\key`). The same secret gets the same placeholder in every request and after restarts, so **the provider's prompt cache keeps hitting** and the conversation stays consistent for the model.
 - **Values stay in memory.** After a restart the map refills by itself: your client resends its history, which contains the real values, and they are redacted again to the same placeholders.
 - **Streaming.** A placeholder can be split across any number of streamed deltas (`[[RED` + `ACTED:op…`). The restorer holds back only a tail that could still become a placeholder — ordinary text is not delayed — and tool-call arguments stay valid JSON even when the restored value contains quotes or backslashes.
-- **Signed blocks are left alone.** Anthropic thinking blocks and OpenAI encrypted reasoning are verified byte for byte by the provider; they are never modified in either direction.
+- **Encoded text is searched too.** Tool results quote logs, configs and API responses, so text is also searched one and two levels down — JSON escapes in any spelling (`\"`, Go's `&`, .NET's `+`, Python's `ä`), HTML entities, percent-encoding, CSV-doubled quotes — and a value found there is replaced exactly where it sits. Card and phone numbers written as JSON numbers are found; other numbers are kept exactly as written (`12345678901234567890`, `1.10`). Placeholders already in a request (the model's own earlier output) are never redacted again.
+- **Signed blocks are left alone.** Anthropic thinking blocks with their signature and OpenAI / OpenRouter encrypted reasoning (summaries included) are verified byte for byte by the provider; they are never modified in either direction. Unsigned reasoning (DeepSeek's `reasoning_content`) is ordinary text.
 - **The model is told.** When a request contains placeholders, one sentence is appended to the end of the system prompt explaining them (so it writes them verbatim instead of asking for the key). Appending at the end keeps cached prefixes intact. `--no-note` turns it off.
 
-- **Fails closed.** A body it cannot redact is refused, never forwarded as it came: invalid JSON → 400, absurd nesting or a compressed body that inflates past the limit → 413, an upload or other binary body → 415 (start with `--allow-unredacted` to forward those as they are; the log marks each one). Plain-text bodies are redacted as text. A redirect to anywhere but the same upstream is refused, because the client would re-send its original, unredacted body there.
+- **Fails closed.** A body it cannot redact is refused, never forwarded as it came: invalid JSON → 400; absurd nesting, a compressed body that inflates past the limit, or more than a million values in one text → 413; an upload, other binary body, or text in a charset other than UTF-8 → 415 (start with `--allow-unredacted` to forward those as they are; the log marks each one). Plain-text bodies are redacted as text, form bodies field by field. A redirect to anywhere but the same upstream is refused, because the client would re-send its original, unredacted body there.
 
-Supported wire formats: Anthropic Messages (also through Vertex AI's `:streamRawPredict`), OpenAI Chat Completions, OpenAI Responses — streamed and not, including tool inputs, earlier tool-call arguments and Codex's custom tools. Other JSON bodies are redacted generically (every string), and a stream on an unrecognised path is identified by its first event.
+Supported wire formats: Anthropic Messages (also through Vertex AI's `:streamRawPredict`), OpenAI Chat Completions, OpenAI Responses — streamed and not, including tool inputs, tool results, earlier tool-call arguments, Predicted Outputs and Codex's custom tools; text files sent as base64. Any other JSON API (Ollama, Gemini, …) is redacted generically — every string and object key — and its responses are restored, including newline-delimited JSON streams (Ollama) and server-sent events on paths it does not know.
+
+Left as they are, on purpose: **tool definitions and output schemas** (written by the client, like its code, and kept byte-stable for the prompt cache), request settings (`stop`, `safety_identifier`, `mcp_servers`), signed blocks, and binary files (images, PDFs).
 
 ## Commands
 
@@ -111,13 +118,14 @@ The request log shows counts only — `POST /anthropic/v1/messages -> 200 1834ms
 
 - Listens on **127.0.0.1 only** and rejects requests whose `Host` is not loopback (no DNS rebinding from a web page). No CORS headers: a browser page cannot read its responses.
 - **On a machine with other users, use `--require-token`.** Any local process that can reach the port can ask the proxy to turn a placeholder it has seen back into its value (that is what the proxy does for responses). With the flag the proxy answers only under a random path token (`http://127.0.0.1:8787/<token>/anthropic`); `llm-redact env` prints the URL with it.
-- Nothing is written to disk except the HMAC key and, with `--require-token`, the token (both created with mode 600). No telemetry, no other network traffic than the upstream you configured.
+- Nothing is written to disk except the HMAC key and, with `--require-token`, the token — both readable by you only (mode 600; on Windows the inherited ACL is replaced by one granting only your account, since a profile folder can be readable by other accounts such as sandbox groups). No telemetry, no other network traffic than the upstream you configured.
 - Zero runtime dependencies — the code that sees your secrets is the code in this repository.
 
 ## Limits — read this
 
 - **Pattern-based.** A secret with no recognisable shape and no telling name around it (`hunter2` in the middle of a sentence) is not found. Names of people, addresses and free-text personal details are not detected. Use `scan` to see what your own files look like.
-- **Uploads are not redacted.** Files sent as `multipart/form-data` or other binary bodies are refused unless you pass `--allow-unredacted`, in which case they go out as they are.
+- **Uploads and binary files are not redacted.** Bodies sent as `multipart/form-data` are refused unless you pass `--allow-unredacted`, in which case they go out as they are. Images and PDFs inside a request are passed through (text files sent as base64 are redacted).
+- **Tool definitions are not redacted.** A key pasted into an MCP server's tool description goes out with it.
 - **Only what goes through the proxy.** Tools the agent runs itself (a web fetch, a `curl`) are outside it.
 - **Placeholders are restored on your side — for whatever wrote them.** That is the design: the model writes `[[REDACTED:…]]` into a command or file and the real value lands on your machine. It also means an agent that has been prompt-injected (by a web page, a README, a tool result) can still be steered into using a restored secret — say, a `curl` that sends it somewhere. llm-redact keeps values away from the *provider*; it does not make an agent safe to run with secrets in reach.
 - The model sees placeholders, so it cannot reason about the *content* of a secret (e.g. "is this key for staging or production?"). That is the point.

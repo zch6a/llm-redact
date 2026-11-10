@@ -5,7 +5,7 @@ llm-redact sees your secrets by design — that is the only way to keep them fro
 ## What it does with your data
 
 - Listens on 127.0.0.1 only; rejects requests whose `Host` header is not loopback (DNS rebinding); sends no CORS headers.
-- Keeps real values in memory only. The one file it writes is a random 32-byte HMAC key (mode 600 on POSIX) used to make placeholders stable; the key cannot be used to recover values.
+- Keeps real values in memory only (the vault, and a bounded cache of redaction results for long texts that agents re-send every turn). The one file it writes is a random 32-byte HMAC key used to make placeholders stable (plus the access token with `--require-token`). Both are owner-only: mode 600 on POSIX; on Windows the inherited ACL is replaced by one granting only your account. The key cannot be used to recover values, but with it someone who sees placeholders could test guesses for low-entropy values (a phone number), so it is kept private.
 - Logs counts per detector, never request bodies, values or placeholders' values.
 - Talks to nothing but the upstreams you configured. No telemetry.
 - Has no runtime dependencies.

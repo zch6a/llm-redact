@@ -2,6 +2,41 @@
 
 All notable changes are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.3.0] — 2026-11-11
+
+A second independent leak review, focused on what 0.2.0 changed, found 20 more problems (19 reproduced). All are fixed, each with a regression test; every fix was then undone once in a copy of the code to make sure some test fails without it.
+
+### Security
+
+- **Encoded text, any spelling.** Values in decoded views (JSON escapes, HTML entities, percent-encoding, CSV quotes) are now replaced by mapping their span back to the original, instead of re-encoding the value and searching for that spelling — so Go's `&`, .NET's `+` and Python's `ä` escapes no longer hide a value.
+- **Predicted Outputs** (`prediction.content`, the file being rewritten) and **`metadata`** are redacted; they were skipped as settings.
+- **Numbers**: card and phone numbers written as JSON numbers are redacted; tool-call arguments with no string hits are no longer returned untouched when they hold such numbers.
+- **Unknown APIs** (Ollama, Gemini, anything not Anthropic/OpenAI) are walked as data — every string and object key — instead of with the OpenAI/Anthropic structure rules.
+- **Tool results** are data whatever their objects' keys are called; a chat message's `name` (the participant) is redacted.
+- A string that only *starts* like a data: URL, or like base64 under a `data` key, is no longer skipped whole. Text files sent as base64 (`data:text/plain;base64,…`, Anthropic `media_type: text/plain` documents) are decoded, redacted and re-encoded.
+- A block is treated as signed only when it carries a signature (or encrypted content); OpenRouter's signed `reasoning.*` details are left alone.
+- **Never a partial redaction**: more than a million values in one text is a 413 refusal (the old per-detector caps stopped matching silently and forwarded the rest).
+- Form bodies are redacted field by field after decoding (`%40`, `+`); `text/*` in a charset other than UTF-8 is refused (415) or, with `--allow-unredacted`, forwarded byte for byte.
+- Reasoning summaries are no longer restored in one event and kept in another: like the rest of signed reasoning, they keep their placeholders (a client sending one back would otherwise send the value in clear).
+
+### Fixed
+
+- Placeholders already in a request were redacted again into nested placeholders (`[[REDACTED:github_token:[[REDACTED:…]]]]`).
+- A placeholder's label no longer depends on which rule saw the value first (`password: sk-proj-…` is an `openai_key`), so placeholders stay the same after a restart.
+- Numbers are kept exactly as written when a body is re-serialised (`12345678901234567890`, `1.10`); `__proto__` keys are no longer dropped.
+- `pass` / `pw` names in JSON text (`{"db":{"pass":"…"}}`), and a bare `token` name, are found; `pass_rate`, `bypass`, Python f-strings are not secrets; passwords containing `<` or `]` are no longer rejected as code.
+- Newline-delimited JSON responses (Ollama streaming) are restored line by line, as they stream, and stay valid JSON.
+- Quadratic work removed: the escaped-text pass (0.8 MB: 13 s → 0.1 s), overlap checks (100,000 values: 9.7 s → 0.3 s), and the SSE parser on large events (16 MB: 1.9 s → 0.02 s). CR-only SSE line endings work.
+- `Expect: 100-continue` (curl) no longer makes the upstream request fail.
+- `reasoning_content` (DeepSeek) and `reasoning` (OpenRouter, vLLM) deltas in chat streams are restored.
+
+### Added
+
+- `npm run smoke`: the real Claude Code and Codex CLIs, against a local mock (no tokens spent), checking that the proxied request is byte-for-byte what the CLI sends directly once placeholders are undone.
+- `llm-redact env` prints `NO_PROXY=127.0.0.1,localhost` (merged with yours): Codex sends even loopback requests through the Windows system proxy.
+- A bounded in-memory cache of redaction results for long texts: agents re-send the whole conversation every turn (5 MB: 290 ms → 3 ms on the next turn).
+- Key and token files get an owner-only ACL on Windows (a profile folder can be readable by other accounts).
+
 ## [0.2.0] — 2026-11-11
 
 An independent leak review found 19 ways for a value to get past the proxy, or for the proxy to fail; all are fixed, each with a regression test (`test/regressions.test.ts`).

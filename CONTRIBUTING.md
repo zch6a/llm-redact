@@ -12,6 +12,7 @@ npm run dev -- scan some-file.txt   # preview redaction
 npm run dev                          # run the proxy from source
 npm test
 npm run check                        # type-check (src, tests) + tests
+npm run smoke                        # the real Claude Code / Codex CLIs against a local mock (if installed)
 ```
 
 ## Layout
@@ -25,10 +26,15 @@ src/
   body.ts       walk Anthropic / OpenAI Chat / OpenAI Responses bodies (what to redact, what never to touch)
   sse.ts        server-sent events: parse, restore per block / choice / item, re-serialise
   proxy.ts      the HTTP proxy
-  cli.ts        start, env, scan, detectors
+  cli.ts        start, env, scan, detectors, stats
 test/
-  core.test.ts  detectors (recall and precision), vault, stream restorer (every split point)
-  proxy.test.ts end to end through a mock upstream for all three APIs, streamed and not
+  core.test.ts        detectors (recall and precision), vault, stream restorer (every split point)
+  proxy.test.ts       end to end through a mock upstream for all three APIs, streamed and not
+  regressions.test.ts one test per finding of the leak reviews
+  cli.test.ts         env output, owner-only files, the redaction cache
+scripts/
+  smoke.ts      the real CLIs, twice each (direct and through the proxy) against a local mock:
+                no leak, values restored, and the request otherwise byte-identical
 ```
 
 ## Adding a detector
@@ -42,4 +48,4 @@ Never commit real keys or personal data as fixtures — build synthetic values (
 
 ## Adding a wire format
 
-Extend `apiFor` (by request path), the request walker in `body.ts` (what is content, what is structure, what is signed), and the SSE restorer in `sse.ts`. Add a mock route in `test/proxy.test.ts`: the two invariants are checked there for every format.
+Extend `apiFor` (by request path), the request walker in `body.ts` (what is content, what is structure, what is signed), and the SSE restorer in `sse.ts`. Add a mock route in `test/proxy.test.ts`: the two invariants are checked there for every format. If a real client speaks it, add it to `scripts/smoke.ts` too — mocks only test what you thought of; a real client sends what it actually sends.

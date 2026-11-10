@@ -6,9 +6,14 @@
  *
  * Detectors run in order; where matches overlap, the earlier detector wins (a private-key block
  * beats the tokens inside it; a provider token beats the generic NAME=value rule).
+ *
+ * Text is also searched one or two encoding levels down — JSON escapes (`\"`, `&`), HTML
+ * entities (`&quot;`), CSV-doubled quotes — because tool results quote logs, configs and API
+ * responses. Every decoded view keeps a map back to the original offsets, so a value found there
+ * is replaced exactly where it is, however the serializer happened to spell it.
  */
 import { DETECTORS, type Detector, type Kind } from './detectors.ts';
-import type { Vault } from './vault.ts';
+import { PLACEHOLDER, type Vault } from './vault.ts';
 
 export interface RedactOptions {
   /** Detector ids to turn off (`email`), or `secret` / `pii` for a whole kind. */
@@ -17,14 +22,64 @@ export interface RedactOptions {
   enable?: string[];
   /** Values never to redact (your own public e-mail in commit messages, a test key). */
   allow?: string[];
+  /** Results for long texts seen before (the proxy keeps one per vault; options must not change while it is in use). */
+  cache?: RedactCache;
 }
 
 export interface Hit {
   detector: string;
   kind: Kind;
+  /** Position in the text (-1 when the value was found in an encoded form and replaced by span mapping). */
   start: number;
   end: number;
   placeholder: string;
+}
+
+/** More matches in one text than any real request has: refuse it rather than redact part of it. */
+export class RedactLimitError extends Error {
+  readonly status = 413;
+}
+
+/**
+ * Agents re-send the whole conversation every turn, so the same long tool results are redacted
+ * again and again. This remembers results for long texts, least recently used out first, bounded
+ * by size. In memory only — like the vault, it holds real values.
+ */
+export class RedactCache {
+  private readonly map = new Map<string, { text: string; hits: Hit[] }>();
+  private size = 0;
+  readonly maxChars: number;
+  /** Texts shorter than this are cheaper to redact than to look up. */
+  static readonly MIN = 1024;
+
+  constructor(maxChars = 32 * 1024 * 1024) {
+    this.maxChars = maxChars;
+  }
+
+  get(text: string): { text: string; hits: Hit[] } | undefined {
+    const r = this.map.get(text);
+    if (r) {
+      this.map.delete(text);
+      this.map.set(text, r);
+    }
+    return r;
+  }
+
+  set(text: string, r: { text: string; hits: Hit[] }): void {
+    const cost = text.length + r.text.length;
+    if (cost > this.maxChars / 4 || this.map.has(text)) return;
+    this.map.set(text, r);
+    this.size += cost;
+    for (const [k, v] of this.map) {
+      if (this.size <= this.maxChars) break;
+      this.map.delete(k);
+      this.size -= k.length + v.text.length;
+    }
+  }
+
+  get entries(): number {
+    return this.map.size;
+  }
 }
 
 export function activeDetectors(opts: RedactOptions = {}): Detector[] {
@@ -45,24 +100,81 @@ function indexed(re: RegExp): RegExp {
   return r;
 }
 
-/** Bounds the work per detector and text: generous, and counted on accepted values, not attempts. */
-const MAX_VALUES = 100_000;
-const MAX_ATTEMPTS = 2_000_000;
+/** Far more values than any real request holds (64 MB of e-mail addresses is ~3 million). */
+const MAX_VALUES = 1_000_000;
+
+interface Span {
+  start: number;
+  end: number;
+}
+interface Found extends Span {
+  detector: Detector;
+  value: string;
+}
+
+/** First index in `spans` (sorted, disjoint) whose end is after `pos`. */
+function firstEndingAfter(spans: Span[], pos: number): number {
+  let lo = 0;
+  let hi = spans.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((spans[mid] as Span).end <= pos) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+const overlapsAny = (spans: Span[], s: number, e: number): boolean => {
+  const i = firstEndingAfter(spans, s);
+  return i < spans.length && (spans[i] as Span).start < e;
+};
+/** Merge two sorted lists of disjoint spans. */
+function mergeSpans(a: Span[], b: Span[]): Span[] {
+  const out: Span[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) out.push(j >= b.length || (i < a.length && (a[i] as Span).start <= (b[j] as Span).start) ? (a[i++] as Span) : (b[j++] as Span));
+  return out;
+}
+
+/** Detectors that recognise a value by its own shape (a provider key), not by its surroundings. */
+const SHAPE_DETECTORS = new Map<string, RegExp>();
+/**
+ * The most specific label for a value: an `sk-proj-…` under a JSON key "password" is still an
+ * openai_key. Labels must depend on the value alone, or the same secret gets a different placeholder
+ * after a restart (and the prompt cache misses). (In text this holds by detector order: the shape
+ * detectors run before the generic NAME=value rule.)
+ */
+export function canonicalDetector(value: string, fallback: Detector, detectors: Detector[] = DETECTORS): Detector {
+  for (const d of detectors) {
+    if (d === fallback || d.group !== undefined || d.kind !== fallback.kind) continue;
+    let whole = SHAPE_DETECTORS.get(d.id);
+    if (!whole) {
+      whole = new RegExp(`^(?:${d.re.source})$`, d.re.flags.replace(/[gy]/g, ''));
+      SHAPE_DETECTORS.set(d.id, whole);
+    }
+    const m = whole.exec(value);
+    if (m && (!d.validate || d.validate(value, m))) return d;
+  }
+  return fallback;
+}
 
 /**
  * Where every detector matches, overlaps resolved, sorted by position. Overlap is judged on the
- * *values*, not the whole matches: a URL's host part must not hide an e-mail after it.
+ * *values*, not the whole matches: a URL's host part must not hide an e-mail after it. Placeholders
+ * already in the text are never matched again (a request carries back the model's own output).
  */
-export function findValues(text: string, detectors: Detector[], allow: Set<string> = new Set()): { detector: Detector; start: number; end: number; value: string }[] {
-  const taken: { start: number; end: number }[] = [];
-  const out: { detector: Detector; start: number; end: number; value: string }[] = [];
-  const overlaps = (s: number, e: number) => taken.some((t) => s < t.end && e > t.start);
+export function findValues(text: string, detectors: Detector[], allow: Set<string> = new Set()): Found[] {
+  let taken: Span[] = [];
+  if (text.includes('[[REDACTED:')) {
+    const re = new RegExp(PLACEHOLDER.source, 'g');
+    for (let m = re.exec(text); m; m = re.exec(text)) taken.push({ start: m.index, end: m.index + m[0].length });
+  }
+  const out: Found[] = [];
   for (const d of detectors) {
     const re = indexed(d.re);
-    let m: RegExpExecArray | null;
-    let attempts = 0;
-    let accepted = 0;
-    while ((m = re.exec(text)) && attempts++ < MAX_ATTEMPTS && accepted < MAX_VALUES) {
+    const mine: Span[] = [];
+    // Each exec moves past its match, so the loop is bounded by the text length.
+    for (let m = re.exec(text); m; m = re.exec(text)) {
       if (m[0] === '') {
         re.lastIndex++;
         continue;
@@ -76,60 +188,146 @@ export function findValues(text: string, detectors: Detector[], allow: Set<strin
       if (d.trimEnd) value = value.replace(d.trimEnd, '');
       if (!value) continue;
       const end = start + value.length;
-      if (allow.has(value) || overlaps(start, end)) continue;
+      if (allow.has(value) || overlapsAny(taken, start, end)) continue;
       if (d.validate && !d.validate(value, m)) continue;
-      taken.push({ start, end });
+      mine.push({ start, end });
       out.push({ detector: d, start, end, value });
-      accepted++;
+      if (out.length > MAX_VALUES) throw new RedactLimitError(`more than ${MAX_VALUES} values to redact in one text; refusing it rather than redacting part of it`);
     }
+    // A detector's own values come in order and do not overlap each other.
+    taken = mergeSpans(taken, mine);
   }
   return out.sort((a, b) => a.start - b.start);
 }
 
-/** JSON-style unescaping (`\"`, `\\`, `\/`, `\n`, `\uXXXX`): how text looks one encoding level down. */
-export function unescapeJsonish(s: string): string {
-  return s.replace(/\\(["\\/bfnrt]|u[0-9a-fA-F]{4})/g, (_, c: string) => (c.length === 5 ? String.fromCharCode(parseInt(c.slice(1), 16)) : ({ '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' } as Record<string, string>)[c] ?? c));
+// ---- decoded views ------------------------------------------------------------------------------
+
+/** A decoded form of the text, with `map[i]` = offset in the original of view character i (`map[length]` = end). */
+interface View {
+  text: string;
+  map: Int32Array;
 }
 
-/** How `value` appears when its text was JSON-encoded once (two spellings of `/`). */
-function encodedForms(value: string): string[] {
-  const once = JSON.stringify(value).slice(1, -1);
-  return [...new Set([once, once.replace(/\//g, '\\/')])];
+const JSON_ESCAPE = /\\(["\\/bfnrt]|u[0-9a-fA-F]{4})/g;
+const JSON_CHAR: Record<string, string> = { '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+const HTML_ENTITY = /&(?:(quot|amp|apos|lt|gt)|#(\d{1,7})|#[xX]([0-9a-fA-F]{1,6}));/g;
+const HTML_CHAR: Record<string, string> = { quot: '"', amp: '&', apos: "'", lt: '<', gt: '>' };
+const DECODERS: { name: string; test: RegExp; re: RegExp; decode: (m: RegExpExecArray) => string }[] = [
+  { name: 'json', test: /\\["\\/bfnrtu]/, re: JSON_ESCAPE, decode: (m) => ((m[1] as string).length === 5 ? String.fromCharCode(parseInt((m[1] as string).slice(1), 16)) : (JSON_CHAR[m[1] as string] ?? (m[1] as string))) },
+  {
+    name: 'html',
+    test: /&(?:quot|amp|apos|lt|gt|#\d|#[xX][0-9a-fA-F]);/,
+    re: HTML_ENTITY,
+    decode: (m) => {
+      if (m[1]) return HTML_CHAR[m[1]] as string;
+      const cp = parseInt((m[2] ?? m[3]) as string, m[2] ? 10 : 16);
+      return cp > 0x10ffff ? m[0] : String.fromCodePoint(cp);
+    },
+  },
+  // Percent-encoding (form data, URLs quoted in logs): li.wei%40corp-mail.cn.
+  { name: 'percent', test: /%(?:40|3[aAdD]|2[fF26bB2])/, re: /%([0-9a-fA-F]{2})/g, decode: (m) => String.fromCharCode(parseInt(m[1] as string, 16)) },
+  // CSV doubles the quotes inside a quoted field, {""api_key"":""xyz""}; an empty JSON string "" is not that.
+  { name: 'csv', test: /[^"]""[A-Za-z_]/, re: /""/g, decode: () => '"' },
+];
+
+/** Decode one level; undefined when there is nothing to decode. */
+function decodeView(v: View, d: (typeof DECODERS)[number]): View | undefined {
+  if (!d.test.test(v.text)) return undefined;
+  const re = new RegExp(d.re.source, d.re.flags);
+  const parts: string[] = [];
+  const map = new Int32Array(v.text.length + 1);
+  let n = 0;
+  let pos = 0;
+  for (let m = re.exec(v.text); m; m = re.exec(v.text)) {
+    for (let i = pos; i < m.index; i++) map[n++] = v.map[i] as number;
+    parts.push(v.text.slice(pos, m.index));
+    const ch = d.decode(m);
+    // Every unit of the decoded character starts where its escape starts.
+    for (let i = 0; i < ch.length; i++) map[n++] = v.map[m.index] as number;
+    parts.push(ch);
+    pos = m.index + m[0].length;
+  }
+  for (let i = pos; i < v.text.length; i++) map[n++] = v.map[i] as number;
+  parts.push(v.text.slice(pos));
+  map[n] = v.map[v.text.length] as number;
+  return { text: parts.join(''), map: map.slice(0, n + 1) };
+}
+
+/** The decoded views worth searching: JSON one and two levels down, HTML entities (and JSON inside them), percent-encoding, CSV quotes. */
+function viewsOf(text: string): View[] {
+  if (!DECODERS.some((d) => d.test.test(text))) return [];
+  const identity = new Int32Array(text.length + 1);
+  for (let i = 0; i <= text.length; i++) identity[i] = i;
+  const root: View = { text, map: identity };
+  const [json, html, percent, csv] = DECODERS as [(typeof DECODERS)[number], (typeof DECODERS)[number], (typeof DECODERS)[number], (typeof DECODERS)[number]];
+  const out: View[] = [];
+  const j1 = decodeView(root, json);
+  if (j1) {
+    out.push(j1);
+    const j2 = decodeView(j1, json);
+    if (j2) out.push(j2);
+  }
+  const h1 = decodeView(root, html);
+  if (h1) {
+    out.push(h1);
+    const hj = decodeView(h1, json);
+    if (hj) out.push(hj);
+  }
+  const p1 = decodeView(root, percent);
+  if (p1) out.push(p1);
+  const c1 = decodeView(root, csv);
+  if (c1) out.push(c1);
+  return out;
 }
 
 export function redactText(text: string, vault: Vault, opts: RedactOptions = {}): { text: string; hits: Hit[] } {
   if (!text) return { text, hits: [] };
+  const cache = opts.cache && text.length >= RedactCache.MIN ? opts.cache : undefined;
+  const cached = cache?.get(text);
+  if (cached) return { text: cached.text, hits: cached.hits.map((h) => ({ ...h })) };
+  const r = redactUncached(text, vault, opts);
+  cache?.set(text, { text: r.text, hits: r.hits.map((h) => ({ ...h })) });
+  return r;
+}
+
+interface Replacement extends Span {
+  detector: Detector;
+  value: string;
+  direct: boolean;
+}
+
+function redactUncached(text: string, vault: Vault, opts: RedactOptions): { text: string; hits: Hit[] } {
   const detectors = activeDetectors(opts);
   const allow = new Set(opts.allow ?? []);
-  const found = findValues(text, detectors, allow);
-  const hits: Hit[] = [];
-  let out = '';
-  let pos = 0;
-  for (const f of found) {
-    const placeholder = vault.placeholderFor(f.detector.id, f.value);
-    out += text.slice(pos, f.start) + placeholder;
-    pos = f.end;
-    hits.push({ detector: f.detector.id, kind: f.detector.kind, start: f.start, end: f.end, placeholder });
-  }
-  out += text.slice(pos);
-  // Text that is itself JSON-encoded (a log line inside a string, a tool result quoting a config
-  // file): look one and two levels down, and replace what is found there in its encoded spelling.
-  if (/\\["\\/nrtu]/.test(out)) {
-    let view = text;
-    for (let level = 0; level < 2 && /\\["\\/nrtu]/.test(view); level++) {
-      view = unescapeJsonish(view);
-      for (const f of findValues(view, detectors, allow)) {
-        const placeholder = vault.placeholderFor(f.detector.id, f.value);
-        const forms = level === 0 ? encodedForms(f.value) : encodedForms(f.value).flatMap(encodedForms);
-        for (const form of forms) {
-          if (!form || !out.includes(form)) continue;
-          out = out.split(form).join(placeholder);
-          hits.push({ detector: f.detector.id, kind: f.detector.kind, start: -1, end: -1, placeholder });
-        }
+  const reps: Replacement[] = findValues(text, detectors, allow).map((f) => ({ ...f, direct: true }));
+  // Values visible only once the text is decoded: map their spans back to the original.
+  if (/[\\&"%]/.test(text)) {
+    let accepted: Span[] = reps.slice();
+    for (const view of viewsOf(text)) {
+      const extra: Replacement[] = [];
+      for (const f of findValues(view.text, detectors, allow)) {
+        const start = view.map[f.start] as number;
+        const end = view.map[f.end] as number;
+        if (end <= start || overlapsAny(accepted, start, end)) continue;
+        extra.push({ ...f, start, end, direct: false });
       }
+      if (!extra.length) continue;
+      reps.push(...extra);
+      accepted = mergeSpans(accepted, extra);
     }
+    reps.sort((a, b) => a.start - b.start);
   }
-  return { text: out, hits };
+  const hits: Hit[] = [];
+  const parts: string[] = [];
+  let pos = 0;
+  for (const f of reps) {
+    const placeholder = vault.placeholderFor(f.detector.id, f.value);
+    parts.push(text.slice(pos, f.start), placeholder);
+    pos = f.end;
+    hits.push({ detector: f.detector.id, kind: f.detector.kind, start: f.direct ? f.start : -1, end: f.direct ? f.end : -1, placeholder });
+  }
+  parts.push(text.slice(pos));
+  return { text: parts.join(''), hits };
 }
 
 /** Counts per detector — what a log or report may show. Never values. */

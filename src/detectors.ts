@@ -58,6 +58,8 @@ export function looksReal(value: string): boolean {
   if (/^[+-]?\d[\d.,_]*(e[+-]?\d+)?[),;]*$/i.test(value)) return false;
   // References and templates: $VAR, $(cmd), %VAR%, {{x}}, <x>.
   if (/^[$%<]|^\{\{/.test(value)) return false;
+  // Python f-strings and other prefixed literals: f"{x}", rb'…'.
+  if (/^[frbu]{1,2}["']/i.test(value)) return false;
   // Sentences, ellipses and URLs are not credentials.
   if (/\s/.test(value) || /\.\.\.|…/.test(value) || /^[a-z][a-z0-9+.-]*:\/\//i.test(value) || value.startsWith('-')) return false;
   if (value.split(/[^A-Za-z0-9]+/).some((w) => EXAMPLE_WORDS.has(w.toLowerCase()))) return false;
@@ -65,7 +67,8 @@ export function looksReal(value: string): boolean {
   if (/[A-Za-z_$][\w$]*(?:\.|::|->)[A-Za-z_$]/.test(value) || /[A-Za-z_$][\w$]*\(/.test(value)) return false;
   // More code: negation, generics and indexing (`!visible`, `Omit<User, …>`, `stats[k]`), paths and
   // regex literals (`/secrets/key`, `./x`, `~/x`), and the tail of a placeholder (`3f9a1c2b]]`).
-  if (/^[!/~]|^\.\.?\//.test(value) || /[<>[\]]/.test(value)) return false;
+  // (Only code-shaped brackets: a generated password may well contain `<` or `]`.)
+  if (/^[!/~]|^\.\.?\//.test(value) || /[A-Za-z_$][\w$]*<[A-Za-z_$]|<\/?[A-Za-z]|[\w$)]\[[\w$'".-]*\]|\]\]|^\[/.test(value)) return false;
   // A bare identifier (letters and underscores, no digit): a variable name like `work_secret`, a type like `string`.
   if (/^[A-Za-z_]+[),;:]*$/.test(value) && value.length < 32) return false;
   // Mixed character classes, or high entropy: what generated secrets look like.
@@ -150,14 +153,15 @@ export const DETECTORS: Detector[] = [
     description: 'Value assigned to a name like *_SECRET, *_TOKEN, *PASSWORD, *_API_KEY',
     // The value: quoted (to the closing quote, honouring backslash escapes, so `"a\"b"` is one value)
     // or unquoted (to whitespace: quotes *inside* an unquoted .env value are part of it).
-    re: /\b([A-Za-z0-9_.-]{0,100}(?:secret|token|passwd|password|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}(?:"((?:[^"\\\n]|\\.){8,400})"|'((?:[^'\\\n]|\\.){8,400})'|`([^`\n]{8,400})`|([^\s"'`<>({\[\\](?:[^\s\\]|\\(?![nrt])){7,399}))/gi,
+    // `pass` / `pw` only as a word of the name (`db.pass`, `DB_PW`), not inside one (`bypass`, `compass`).
+    re: /\b([A-Za-z0-9_.-]{0,100}(?:secret|token|passwd|password|pwd|(?<![A-Za-z0-9])(?:pass|pw)(?![A-Za-z0-9_])|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}(?:"((?:[^"\\\n]|\\.){8,400})"|'((?:[^'\\\n]|\\.){8,400})'|`([^`\n]{8,400})`|([^\s"'`<>({\[\\](?:[^\s\\]|\\(?![nrt])){7,399}))/gi,
     trimEnd: /[,;)}\]]+$/,
     group: [2, 3, 4, 5],
     validate: (v, m) => {
       const name = (m[1] as string).toLowerCase();
       // Names that say "a count / a place / a kind", not "a credential": max_tokens, token_endpoint, secret_name.
       if (/(type|length|count|name|file|path|url|uri|endpoint|host|domain|server|base|prefix|header|field|id|limit|budget|usage|ttl|hint|label|format|expir\w*)s?$/.test(name)) return false;
-      if (/^(max|min|num|n|total|input|output|prompt|completion|cached?|cache_read|cache_creation|remaining|used|reasoning)[_-]?tokens?(_[a-z]+)?$|^tokens?$/.test(name)) return false;
+      if (/^(max|min|num|n|total|input|output|prompt|completion|cached?|cache_read|cache_creation|remaining|used|reasoning)[_-]?tokens?(_[a-z]+)?$|^tokens$/.test(name)) return false;
       return looksReal(v) && !/^(true|false|null|none|undefined)$/i.test(v);
     },
   },

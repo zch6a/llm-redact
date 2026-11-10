@@ -1,11 +1,11 @@
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseArgs, type ParseArgsConfig } from 'node:util';
 import { DETECTORS } from './detectors.ts';
 import { DEFAULT_UPSTREAMS, createProxy } from './proxy.ts';
 import { redactText, summarize, type RedactOptions } from './redact.ts';
-import { Vault, defaultKeyPath, loadKey } from './vault.ts';
+import { Vault, defaultKeyPath, loadKey, writePrivate } from './vault.ts';
 import { VERSION } from './version.ts';
 
 const HELP = `llm-redact — keep API keys, tokens and personal data out of your AI agent's requests.
@@ -79,8 +79,7 @@ function loadToken(): string {
     // first use
   }
   const t = randomBytes(16).toString('hex');
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, t + '\n', { mode: 0o600 });
+  writePrivate(file, t + '\n');
   return t;
 }
 
@@ -178,6 +177,13 @@ export function envText(client: string, port: number, shell: Shell, current: Nod
       '',
     );
   if (!out.length) throw new UsageError(`unknown client "${client}": claude, codex, openai, deepseek or all`);
+  // Requests to the proxy itself must not go through an HTTP proxy: with HTTPS_PROXY set, or a
+  // system-wide proxy (Codex uses the Windows one), they would get a 502 from it instead.
+  const existing = (current.NO_PROXY ?? current.no_proxy ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const noProxy = [...new Set(['127.0.0.1', 'localhost', ...existing])].join(',');
+  out.push('# Keep requests to llm-redact away from any HTTP proxy (system-wide or HTTPS_PROXY)', setVar(shell, 'NO_PROXY', noProxy));
+  // Windows variables are case-insensitive; elsewhere some tools read only the lower-case one.
+  if (shell !== 'powershell' && shell !== 'cmd') out.push(setVar(shell, 'no_proxy', noProxy));
   return out.join('\n').trimEnd();
 }
 
