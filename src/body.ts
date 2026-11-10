@@ -66,6 +66,8 @@ export function isSigned(o: Record<string, unknown>): boolean {
   return typeof o.signature === 'string' || typeof o.encrypted_content === 'string' || typeof o.data === 'string' || (t === 'reasoning' && typeof o.id === 'string');
 }
 
+/** A number literal JSON.parse would not round-trip exactly. */
+const NUMBER_CHANGES = /\d{16}|\d\.\d*0(?![\d.])|\d[eE][+-]?\d|-0(?![\d.])/;
 const hasRawJson = typeof (JSON as { rawJSON?: unknown }).rawJSON === 'function';
 const isRaw = (v: unknown): v is { rawJSON: string } => hasRawJson && (JSON as unknown as { isRawJSON(x: unknown): boolean }).isRawJSON(v);
 
@@ -75,7 +77,10 @@ const isRaw = (v: unknown): v is { rawJSON: string } => hasRawJson && (JSON as u
  */
 export function parseJson(text: string): unknown {
   try {
-    if (!hasRawJson) return JSON.parse(text);
+    // The reviver costs a call per value (7x on a body of many small fields); only numbers that
+    // JSON.parse would change need it — 16+ digits, a trailing zero after the point, an exponent,
+    // -0. (A match inside a string only costs the slow path.)
+    if (!hasRawJson || !NUMBER_CHANGES.test(text)) return JSON.parse(text);
     const raw = (JSON as unknown as { rawJSON(s: string): unknown }).rawJSON;
     return JSON.parse(text, (_k, v: unknown, ctx?: { source?: string }) => (typeof v === 'number' && ctx?.source !== undefined && String(v) !== ctx.source ? raw(ctx.source) : v));
   } catch (err) {

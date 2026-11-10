@@ -945,3 +945,10 @@ describe('round 4: config and key files', () => {
     }
   });
 });
+// ==== Round 5 =====================================================================================
+
+describe('round 5: fast paths keep their promises', () => {
+  it('parseJson takes the slow path for every number JSON.parse would change, the fast one otherwise', { skip: typeof (JSON as { rawJSON?: unknown }).rawJSON !== 'function' && 'needs JSON.rawJSON' }, () => {
+    for (const s of ['{"a":12345678901234567890}', '{"a":1.10}', '{"a":1e5}', '{"a":-0}', '{"a":1.5E3}', '{"a":0.12345678901234567891}', '{"a":1.25,"b":[1,2,3],"c":-7}', '{"a":100,"b":"1.10 in a string"}']) assert.equal(JSON.stringify(parseJson(s)), s);
+  });
+});

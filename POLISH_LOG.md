@@ -107,10 +107,12 @@ Done then: `src/detectors.ts`, `src/vault.ts`, `src/redact.ts`, `src/stream.ts`;
 
 222 tests (was 204).
 
-## Round 5 — backlog (the last round of the first cycle)
+## Round 5 — in progress (the last round of the first cycle)
 
-- **Profile the latency rise first**: the soak's 1 MB requests went from p50 63 ms (0.4.0) to ~80–90 ms (0.5.0). Suspects: the request re-walk (every third turn teaches a value, so the whole body is walked twice), the recall tokenizer, the known-value pass; the cache shortcut alone did not bring it back.
-- Read every source file top to bottom for coherence after four rounds of fixes (vault.ts and redact.ts grew the most); simplify where fixes overlap.
-- README: re-verify every claim against a run (numbers, flags, file names) — it has been edited by four rounds.
-- A fifth review, fresh: "would you trust this with your keys?" — the overall design, not a specific area.
-- `COMPATIBILITY.md`-style stability promise for 1.0 (placeholder format, config keys, CLI flags), as skill-guard has.
+- [x] **The latency rise, profiled** (CPU profile of a warm 1.3 MB request in a growing history): a third of the time was one tiny regex, `[A-Za-z0-9+/_-]{16}` — the base64 test added to cache validation in 0.5.0, run on *every* cached text whenever a turn learned a value. Whether a text holds a base64-looking token does not change, so the cache now records it once per entry: turns that learn a value 15.9 → 4.4 ms of proxy time. The rest of the soak latency was parsing: `parseJson`'s reviver (exact numbers, since 0.3.0) costs a call per value — 50 ms instead of 7 ms on 1.4 MB of small fields. It now takes the slow path only when the text holds a number `JSON.parse` would change (16+ digits, a trailing zero after the point, an exponent, `-0`): 10 ms. Soak, 1 MB requests: p50 back to 63–67 ms (0.4.0: 63–66; 0.5.0 before this: 79–98), with every 0.5.0 protection in place.
+- [ ] Fifth independent review — "would you trust this with your keys?", the design as a whole and the 1.0 surface — running.
+- [ ] Read every source file top to bottom for coherence; simplify where fixes overlap (after the review, to include what it finds).
+- [ ] README: re-verify every claim against a run.
+- [ ] `COMPATIBILITY.md` stability promise for 1.0 (placeholder format, config keys, CLI flags, files on disk), as skill-guard has; then 1.0.0.
+
+223 tests.

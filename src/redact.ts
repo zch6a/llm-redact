@@ -42,6 +42,8 @@ interface Cached {
   values: [string, string][];
   /** Where the vault's known-value log stood when this was computed. */
   mark: { epoch: number; at: number };
+  /** Whether the text holds a base64-looking token (worked out once: a later value could hide in one). */
+  b64?: boolean;
 }
 
 /** More matches in one text than any real request has: refuse it rather than redact part of it. */
@@ -308,7 +310,7 @@ export function redactText(text: string, vault: Vault, opts: RedactOptions = {})
     mark = vault.knownMark;
     r = redactUncached(text, vault, opts);
   }
-  cache?.set(text, { text: r.text, hits: r.hits.map((h) => ({ ...h })), values: r.values, mark });
+  cache?.set(text, { text: r.text, hits: r.hits.map((h) => ({ ...h })), values: r.values, mark, b64: hasBase64(text) });
   return { text: r.text, hits: r.hits };
 }
 
@@ -319,7 +321,7 @@ export function redactText(text: string, vault: Vault, opts: RedactOptions = {})
 function cacheValid(cached: Cached, text: string, vault: Vault): boolean {
   if (!cached.values.every(([label, value], i) => vault.placeholderFor(label, value) === cached.hits[i]?.placeholder)) return false;
   const learned = vault.knownSince(cached.mark);
-  if (!learned || (learned.length && occursIn(text, learned))) return false;
+  if (!learned || (learned.length && occursIn(text, learned, cached.b64 ?? true))) return false;
   cached.mark = vault.knownMark;
   return true;
 }
@@ -331,10 +333,10 @@ interface Replacement extends Span {
 }
 
 /** Does any of `values` occur in `text` — as it is, or in one of its decoded views? */
-function occursIn(text: string, values: string[]): boolean {
+function occursIn(text: string, values: string[], b64: boolean): boolean {
   if (values.some((v) => text.includes(v))) return true;
   // Inside a base64 token it could be anywhere: recompute rather than decode every token here.
-  if (/[A-Za-z0-9+/_-]{16}/.test(text) && [...text.matchAll(BASE64_TOKEN)].some((m) => looksBase64(m[0]))) return true;
+  if (b64) return true;
   // Values made of encoding-proof characters can be in a decoded view only if they are in the text.
   if (values.every((v) => /^[A-Za-z0-9._~-]+$/.test(v))) return false;
   return viewsOf(text).some((view) => values.some((v) => view.text.includes(v)));
@@ -343,6 +345,13 @@ function occursIn(text: string, values: string[]): boolean {
 /** Base64 tokens: 16+ characters in whole groups of 4, standard or URL-safe, at most 64 KB each. */
 const BASE64_TOKEN = /(?<![A-Za-z0-9+/=_-])(?:[A-Za-z0-9+/_-]{4}){4,16384}(?:[A-Za-z0-9+/_-]{2}==|[A-Za-z0-9+/_-]{3}=)?(?![A-Za-z0-9+/=_-])/g;
 const MAX_BASE64_TOKENS = 5_000;
+/** Does 	ext hold a token that looks like base64 (the same test base64Secrets applies)? */
+function hasBase64(text: string): boolean {
+  if (text.length < 16) return false;
+  for (const m of text.matchAll(BASE64_TOKEN)) if (looksBase64(m[0])) return true;
+  return false;
+}
+
 /** An identifier or a word is not base64: it needs a digit, + / - _ or padding, and both cases. */
 const looksBase64 = (token: string) => /[\d+/=_-]/.test(token) && /[A-Z]/.test(token) && /[a-z]/.test(token);
 
