@@ -31,10 +31,10 @@ Design decisions so far:
 
 Done then: `src/detectors.ts`, `src/vault.ts`, `src/redact.ts`, `src/stream.ts`; 60 tests.
 
-## Round 1 — backlog
+## Round 1 — in progress
 
-- [ ] Run it for real with Claude Code against the user's actual setup (they route through a relay: `--upstream anthropic=<relay>`) — needs the user, since it spends tokens; until then, a recorded-format replay test from real SSE captures if any are available locally.
-- [ ] Independent review before 1.0 (lesson from skill-guard): leaks first — body shapes the walker skips, encodings, fields.
-- [ ] Corpus for precision: run `scan` over real repositories (read-only) and count what would be redacted that is not a secret.
-- [ ] Gemini / other formats? Only if a target client needs them.
-- [ ] `stats` endpoint / command: what was redacted this session (counts).
+- [x] **Precision on real code.** Ran every detector over 2,955 real files (19 MB: the five public skill repositories from skill-guard's corpus plus this workspace's three projects), printing hits with values masked. The generic `NAME=value` rule had **317 hits, nearly all false**: shell references (`$ANTHROPIC_API_KEY"`), code (`Environment.GetEnvironmentVariable(…)`, `result.InputTokens`, `sum(…)`), bare identifiers (`work_secret`), types (`password: string`), generics, negations, paths, URLs (`token_endpoint: "https://…"`), sentences in quotes, numbers (`"token_efficiency": 0.93…`), token counts (`max_tokens`), and documentation placeholders with a provider prefix (`ghp_your_github_token`, `sk-your-secret-here`, `sk-ant-invalid`). Now **25**, all genuinely password-shaped example or test values. Card numbers: decimals that pass Luhn by chance (`65.4545454545454`) excluded, 14 → 9 (the rest are Stripe's published test cards). URL passwords: dummy values (`postgres:test@localhost`) excluded. Each class is now a negative test (19 new cases); recall tests unchanged.
+- [x] **Real request shapes.** Surveyed local Claude Code and Codex session logs for block/item types and key names only (no content read out): every shape is handled — except **Codex custom tool calls** (`apply_patch` is one). Requests were fine (their `input` is redacted), but in a streamed response the patch arrives as `response.custom_tool_call_input.delta`, which was not restored: a patch writing a key into `.env` would have written the *placeholder* to disk. Fixed for Responses and Chat Completions custom tools, with an end-to-end test.
+- [x] `llm-redact stats`: what a running proxy has redacted so far (counts only).
+- [ ] Independent leak review — running.
+- [ ] Run it for real with Claude Code against the user's setup (spends their tokens: needs their go-ahead).

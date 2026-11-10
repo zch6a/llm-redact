@@ -147,7 +147,10 @@ export class SseRestorer {
         if (typeof delta.content === 'string') delta.content = this.restorer(`c${ci}`, false).push(delta.content);
         if (Array.isArray(delta.tool_calls))
           delta.tool_calls = delta.tool_calls.map((tc) => {
-            if (!isObj(tc) || !isObj(tc.function) || typeof tc.function.arguments !== 'string') return tc;
+            if (!isObj(tc)) return tc;
+            // Custom tools stream free text in `custom.input`; function tools stream JSON in `function.arguments`.
+            if (isObj(tc.custom) && typeof tc.custom.input === 'string') return { ...tc, custom: { ...tc.custom, input: this.restorer(`u${ci}.${String(tc.index ?? 0)}`, false).push(tc.custom.input) } };
+            if (!isObj(tc.function) || typeof tc.function.arguments !== 'string') return tc;
             return { ...tc, function: { ...tc.function, arguments: this.restorer(`t${ci}.${String(tc.index ?? 0)}`, true).push(tc.function.arguments) } };
           });
       }
@@ -161,12 +164,12 @@ export class SseRestorer {
   private drainChoice(ci: string, delta: Json): void {
     const text = this.take(`c${ci}`);
     if (text) delta.content = (typeof delta.content === 'string' ? delta.content : '') + text;
-    for (const key of [...this.restorers.keys()].filter((k) => k.startsWith(`t${ci}.`))) {
+    for (const key of [...this.restorers.keys()].filter((k) => k.startsWith(`t${ci}.`) || k.startsWith(`u${ci}.`))) {
       const tail = this.take(key);
       if (!tail) continue;
       const index = Number(key.slice(key.indexOf('.') + 1));
       const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-      delta.tool_calls = [...calls, { index, function: { arguments: tail } }];
+      delta.tool_calls = [...calls, key.startsWith('u') ? { index, custom: { input: tail } } : { index, function: { arguments: tail } }];
     }
   }
 
@@ -190,6 +193,14 @@ export class SseRestorer {
     const argKey = `f${String(d.item_id ?? '')}`;
     if (t === 'response.output_text.delta' && typeof d.delta === 'string') return [{ ...d, delta: this.restorer(textKey, false).push(d.delta) }];
     if (t === 'response.function_call_arguments.delta' && typeof d.delta === 'string') return [{ ...d, delta: this.restorer(argKey, true).push(d.delta) }];
+    // Custom (freeform) tools — Codex's apply_patch is one: the input is plain text, not JSON.
+    const customKey = `x${String(d.item_id ?? '')}`;
+    if (t === 'response.custom_tool_call_input.delta' && typeof d.delta === 'string') return [{ ...d, delta: this.restorer(customKey, false).push(d.delta) }];
+    if (t === 'response.custom_tool_call_input.done') {
+      const tail = this.take(customKey);
+      const done = { ...d, input: typeof d.input === 'string' ? this.vault.restore(d.input) : d.input };
+      return tail ? [{ head: replaceEvent(head, 'response.custom_tool_call_input.delta'), data: JSON.stringify({ ...d, type: 'response.custom_tool_call_input.delta', delta: tail, input: undefined }) }, done] : [done];
+    }
     if (t === 'response.output_text.done') {
       const tail = this.take(textKey);
       const done = { ...d, text: typeof d.text === 'string' ? this.vault.restore(d.text) : d.text };

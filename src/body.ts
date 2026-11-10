@@ -29,7 +29,7 @@ export function apiFor(path: string): Api {
 }
 
 /** Keys whose string values are structure, not content. */
-const STRUCTURAL = new Set(['id', 'model', 'role', 'type', 'name', 'tool_use_id', 'tool_call_id', 'call_id', 'item_id', 'previous_response_id', 'stop_reason', 'finish_reason', 'stop_sequence', 'stop_sequences', 'stop', 'media_type', 'format', 'detail', 'object', 'status', 'signature', 'encrypted_content', 'cache_control', 'service_tier', 'reasoning_effort', 'user', 'safety_identifier', 'prompt_cache_key']);
+const STRUCTURAL = new Set(['id', 'model', 'role', 'type', 'name', 'tool_name', 'namespace', 'phase', 'tool_use_id', 'tool_call_id', 'call_id', 'item_id', 'previous_response_id', 'stop_reason', 'finish_reason', 'stop_sequence', 'stop_sequences', 'stop', 'media_type', 'format', 'detail', 'object', 'status', 'signature', 'encrypted_content', 'cache_control', 'service_tier', 'reasoning_effort', 'user', 'safety_identifier', 'prompt_cache_key']);
 /** Keys whose whole subtree is left alone. */
 const OPAQUE = new Set(['tools', 'tool_choice', 'functions', 'function_call', 'response_format', 'text_format', 'metadata', 'cache_control', 'reasoning', 'thinking', 'container']);
 /** Block / item types that are signed or binary. */

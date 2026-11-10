@@ -44,9 +44,28 @@ export function entropy(s: string): number {
 /** Values that are obviously not real secrets: documentation placeholders and references. */
 const PLACEHOLDER = /^(x+|\*+|\.+|-+|_+|0+|1234\d*|<[^>]*>|\$\{?[A-Za-z_][\w.]*\}?|%[A-Za-z_]+%|\{\{[^}]*\}\}|(your|my|the|a|an|some|example|sample|dummy|fake|test|changeme|change_me|placeholder|redacted|secret|password|passwd|token|apikey|api_key|key|value|xxx|todo|none|null|undefined|true|false)([_-][a-z0-9]{0,20}){0,6})$/i;
 
+/** Words that make a value an example, not a credential: "ghp_your_github_token", "sk-your-secret-here". */
+const EXAMPLE_WORDS = new Set(['your', 'my', 'example', 'sample', 'placeholder', 'here', 'xxx', 'xxxx', 'dummy', 'fake', 'invalid', 'changeme', 'replace', 'insert', 'enter', 'todo', 'redacted', 'new', 'goes', 'put', 'paste']);
+/** Provider prefixes stripped before the placeholder check ("sk-", "ghp_", "xoxb-", "sk_live_"). */
+const PROVIDER_PREFIX = /^(sk-(?:ant-|proj-)?|gh[pousr]_|github_pat_|glpat-|xox[a-z]-|(?:sk|rk|pk)_(?:live|test)_|hf_|npm_|AKIA|AIza)/i;
+
 export function looksReal(value: string): boolean {
-  if (PLACEHOLDER.test(value)) return false;
-  if (/^\[\[REDACTED:/.test(value)) return false;
+  if (PLACEHOLDER.test(value) || PLACEHOLDER.test(value.replace(PROVIDER_PREFIX, ''))) return false;
+  if (/^\[\[REDACTED:|^\[?REDACTED\]?$/i.test(value)) return false;
+  // A number (a score, a count, a price) is not a credential.
+  if (/^[+-]?\d[\d.,_]*(e[+-]?\d+)?[),;]*$/i.test(value)) return false;
+  // References and templates: $VAR, $(cmd), %VAR%, {{x}}, <x>.
+  if (/^[$%<]|^\{\{/.test(value)) return false;
+  // Sentences, ellipses and URLs are not credentials.
+  if (/\s/.test(value) || /\.\.\.|…/.test(value) || /^[a-z][a-z0-9+.-]*:\/\//i.test(value) || value.startsWith('-')) return false;
+  if (value.split(/[^A-Za-z0-9]+/).some((w) => EXAMPLE_WORDS.has(w.toLowerCase()))) return false;
+  // Code: member access (a.b, a::b, a->b) or a call — `Environment.GetEnvironmentVariable(…)`, `result.tokens`.
+  if (/[A-Za-z_$][\w$]*(?:\.|::|->)[A-Za-z_$]/.test(value) || /[A-Za-z_$][\w$]*\(/.test(value)) return false;
+  // More code: negation, generics and indexing (`!visible`, `Omit<User, …>`, `stats[k]`), paths and
+  // regex literals (`/secrets/key`, `./x`, `~/x`), and the tail of a placeholder (`3f9a1c2b]]`).
+  if (/^[!/~]|^\.\.?\//.test(value) || /[<>[\]]/.test(value)) return false;
+  // A bare identifier (letters and underscores, no digit): a variable name like `work_secret`, a type like `string`.
+  if (/^[A-Za-z_]+[),;:]*$/.test(value) && value.length < 32) return false;
   // Mixed character classes, or high entropy: what generated secrets look like.
   const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((r) => r.test(value)).length;
   return entropy(value) >= 3 && (classes >= 2 || value.length >= 20);
@@ -119,7 +138,7 @@ export const DETECTORS: Detector[] = [
   { id: 'telegram_bot_token', kind: 'secret', description: 'Telegram bot token', re: /\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b/g },
   { id: 'jwt', kind: 'secret', description: 'JSON Web Token', re: /\beyJ[A-Za-z0-9_-]{10,2000}\.eyJ[A-Za-z0-9_-]{10,4000}\.[A-Za-z0-9_-]{10,2000}/g },
   // After the provider tokens: a GitHub token used as a URL password keeps its specific label.
-  { id: 'url_password', kind: 'secret', description: 'Password inside a URL (postgres://user:PASSWORD@host)', re: /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@'"`]{1,100}:([^\s@/'"`]{3,200})@[^\s/'"`]{1,200}/gi, group: 1, validate: (v) => !/^\$\{?\w+\}?$|^\*+$|^(password|pass|pwd|secret)$/i.test(v) && !/^\[\[REDACTED:/.test(v) },
+  { id: 'url_password', kind: 'secret', description: 'Password inside a URL (postgres://user:PASSWORD@host)', re: /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@'"`]{1,100}:([^\s@/'"`]{3,200})@[^\s/'"`]{1,200}/gi, group: 1, validate: (v) => !/^\$\{?\w+\}?$|^\*+$|^(password|passwd|pass|pwd|secret|test|testing|postgres|root|admin|user|guest|example|changeme|dev|local|mysql|redis|app)$/i.test(v) && !/^\[\[REDACTED:|^\[?REDACTED\]?$/i.test(v) },
   { id: 'bearer_token', kind: 'secret', description: 'Bearer token in an Authorization header', re: /\b(?:Authorization|authorization)["']?\s*[:=]\s*["']?Bearer\s+([A-Za-z0-9._~+/=-]{16,2000})/g, group: 1, validate: (v) => looksReal(v) },
 
   // ---- generic: NAME=value where the name says secret and the value looks generated
@@ -131,7 +150,13 @@ export const DETECTORS: Detector[] = [
     // or unquoted (to whitespace: quotes *inside* an unquoted .env value are part of it).
     re: /\b([A-Za-z0-9_.-]{0,40}(?:secret|token|passwd|password|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}(?:"((?:[^"\\\n]|\\.){8,400})"|'((?:[^'\\\n]|\\.){8,400})'|`([^`\n]{8,400})`|([^\s"'`<>({\[][^\s]{7,399}?)(?=[,;)}\]]*(?:\s|$)))/gi,
     group: [2, 3, 4, 5],
-    validate: (v, m) => looksReal(v) && !/^(true|false|null|none|undefined)$/i.test(v) && !/\(\)$/.test(v) && !/^(process\.env|os\.environ|env\.|config\.|settings\.|self\.|this\.|args\.|options\.|params\.)/i.test(v) && !/(type|length|count|name|file|path|url|header|field|id|limit|ttl|expir\w*)$/i.test((m[1] as string).replace(/s$/, '')),
+    validate: (v, m) => {
+      const name = (m[1] as string).toLowerCase();
+      // Names that say "a count / a place / a kind", not "a credential": max_tokens, token_endpoint, secret_name.
+      if (/(type|length|count|name|file|path|url|uri|endpoint|host|domain|server|base|prefix|header|field|id|limit|budget|usage|ttl|hint|label|format|expir\w*)s?$/.test(name)) return false;
+      if (/^(max|min|num|n|total|input|output|prompt|completion|cached?|cache_read|cache_creation|remaining|used|reasoning)[_-]?tokens?(_[a-z]+)?$|^tokens?$/.test(name)) return false;
+      return looksReal(v) && !/^(true|false|null|none|undefined)$/i.test(v);
+    },
   },
 
   // ---- personal data
@@ -139,7 +164,8 @@ export const DETECTORS: Detector[] = [
   { id: 'cn_id_card', kind: 'pii', description: 'Chinese resident ID number (checksum validated)', re: /(?<![\dA-Za-z])[1-9]\d{16}[\dXx](?![\dA-Za-z])/g, validate: (v) => cnIdValid(v) },
   { id: 'cn_mobile', kind: 'pii', description: 'Chinese mobile number', re: /(?<![\dA-Za-z+.-])(?:\+?86[ -]?)?1[3-9]\d[ -]?\d{4}[ -]?\d{4}(?![\dA-Za-z])/g },
   { id: 'phone', kind: 'pii', description: 'Phone number in international format (+1 415 555 0100)', re: /(?<![\w+])\+[1-9]\d{0,2}[ .-]?\(?\d{1,4}\)?(?:[ .-]?\d{2,4}){2,4}(?![\w])/g, validate: (v) => v.replace(/\D/g, '').length >= 9 && v.replace(/\D/g, '').length <= 15 },
-  { id: 'credit_card', kind: 'pii', description: 'Payment card number (Luhn validated)', re: /(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])/g, validate: (v) => {
+  // Not the digits of a decimal (65.4545454545454 passes Luhn by chance) or of a longer number.
+  { id: 'credit_card', kind: 'pii', description: 'Payment card number (Luhn validated)', re: /(?<![\d.,-])(?:\d[ -]?){12,18}\d(?![\d-]|[.,]\d)/g, validate: (v) => {
     const d = v.replace(/\D/g, '');
     return d.length >= 13 && d.length <= 19 && /^(4|5[1-5]|2[2-7]|3[47]|6(011|5|4[4-9]|22)|35|62)/.test(d) && luhn(d) && !/^(\d)\1+$/.test(d);
   } },

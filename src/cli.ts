@@ -17,6 +17,7 @@ Usage
   llm-redact env [client]          what to set for claude, codex, openai, deepseek (default: all)
   llm-redact scan [file|-]         show what a file would look like after redaction
   llm-redact detectors             list what is detected
+  llm-redact stats                 what a running proxy has redacted so far (counts only)
 
 Options
   -p, --port <n>             port (default 8787; the proxy only listens on 127.0.0.1)
@@ -173,6 +174,27 @@ function cmdScan(v: Values, file: string | undefined): number {
   return 0;
 }
 
+/** Ask a running proxy what it has redacted since it started (counts only). */
+async function cmdStats(v: Values): Promise<number> {
+  const port = loadConfig(v).port;
+  let s: { version?: string; stats?: { requests: number; redacted: Record<string, number> } };
+  try {
+    s = (await (await fetch(`http://127.0.0.1:${port}/`)).json()) as typeof s;
+  } catch {
+    console.error(`No llm-redact proxy answering on port ${port}. Start it with \`llm-redact\`.`);
+    return 1;
+  }
+  if (v.json) {
+    process.stdout.write(JSON.stringify(s.stats, null, 2) + '\n');
+    return 0;
+  }
+  const r = s.stats?.redacted ?? {};
+  const total = Object.values(r).reduce((a, b) => a + b, 0);
+  console.log(`llm-redact ${s.version} on port ${port}: ${s.stats?.requests ?? 0} request(s), ${total} value(s) redacted`);
+  for (const [k, n] of Object.entries(r).sort((a, b) => b[1] - a[1])) console.log(`  ${k.padEnd(20)} ${n}`);
+  return 0;
+}
+
 function cmdDetectors(): number {
   for (const d of DETECTORS) console.log(`${d.id.padEnd(20)} ${d.kind.padEnd(7)} ${d.description}${d.optional ? ' (off by default: --enable ' + d.id + ')' : ''}`);
   return 0;
@@ -210,6 +232,8 @@ export async function main(argv: string[]): Promise<number> {
         return cmdScan(v, rest[0]);
       case 'detectors':
         return cmdDetectors();
+      case 'stats':
+        return await cmdStats(v);
       default:
         throw new UsageError(`unknown command "${cmd}"`);
     }

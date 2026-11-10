@@ -113,6 +113,26 @@ describe('detectors: precision', () => {
     '11010519491231002Y', // bad ID check digit
     'GB82 WEST 1234 5698 7654 33', // bad IBAN check
     '[[REDACTED:openai_key:3f9a1c2b]]', // already a placeholder
+    // Found by running the detectors over 2,955 real files (public skill repos + this workspace):
+    'ApiKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")',
+    'long tokens = result.InputTokens;',
+    '-H "x-api-key: $ANTHROPIC_API_KEY" \\',
+    '{"model":"claude-x","max_tokens":16000,"messages":[]}',
+    'token_endpoint: "https://slack.com/api/oauth.v2.access",',
+    "authorization_token: 'ghp_your_github_token',",
+    '"secret_value": "sk-your-secret-here",',
+    'ANTHROPIC_API_KEY=sk-ant-invalid',
+    'CREDENTIALS_HINT = "set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN"',
+    'max_tokens = --max-tokens',
+    '"x-api-key": api_key,',
+    'work_secret=work_secret,',
+    '"token_efficiency": 0.9387755102040816,',
+    'login(email: string, password: string): Promise<void>;',
+    'type UserWithoutPassword = Omit<User, "password">;',
+    '--from-file=API_KEY=/secrets/api-key',
+    'passwordVisible = !passwordVisible',
+    '"composite": 65.45454545454545,', // a decimal that passes Luhn
+    'DATABASE_URL: postgres://postgres:test@localhost/test',
   ];
   for (const text of clean)
     it(`leaves alone: ${text.slice(0, 60)}`, () => {

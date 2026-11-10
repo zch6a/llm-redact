@@ -36,7 +36,7 @@ function reply(body: any): { text: string; args: string; ph: string } {
   return { ph, text: `Saved. Your key is ${ph} — keep it safe.`, args: JSON.stringify({ path: '.env', content: `OPENAI_API_KEY=${ph}\nDB_PASSWORD=${pw}\n` }) };
 }
 
-function handle(path: string, body: any): { type: string; payload: string } {
+function handle(path: string, body: any, custom = false): { type: string; payload: string } {
   const r = reply(body);
   if (path === '/v1/messages') {
     if (!body.stream)
@@ -75,6 +75,23 @@ function handle(path: string, body: any): { type: string; payload: string } {
       ]),
     };
   }
+  if (path === '/v1/responses' && custom) {
+    // Codex's apply_patch is a custom (freeform) tool: its input streams as plain text.
+    const patch = `*** Begin Patch\n*** Add File: .env\n+OPENAI_API_KEY=${r.ph}\n*** End Patch`;
+    let seq = 0;
+    const ev = (d: Record<string, unknown>) => [String(d.type), { ...d, sequence_number: seq++ }] as [string, unknown];
+    const item = { id: 'ctc_1', type: 'custom_tool_call', call_id: 'call_9', name: 'apply_patch', input: patch };
+    return {
+      type: 'text/event-stream',
+      payload: sse([
+        ev({ type: 'response.output_item.added', output_index: 0, item: { ...item, input: '' } }),
+        ...pieces(patch, 5).map((p) => ev({ type: 'response.custom_tool_call_input.delta', item_id: 'ctc_1', output_index: 0, delta: p })),
+        ev({ type: 'response.custom_tool_call_input.done', item_id: 'ctc_1', output_index: 0, input: patch }),
+        ev({ type: 'response.output_item.done', output_index: 0, item }),
+        ev({ type: 'response.completed', response: { id: 'resp_2', output: [item] } }),
+      ]),
+    };
+  }
   if (path === '/v1/responses') {
     const item = { id: 'fc_1', type: 'function_call', call_id: 'call_1', name: 'write_file', arguments: r.args };
     const msg = { id: 'msg_1', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: r.text }] };
@@ -109,7 +126,7 @@ before(async () => {
     } catch {
       lastBody = raw;
     }
-    const { type, payload } = handle((req.url ?? '').split('?')[0] as string, lastBody ?? {});
+    const { type, payload } = handle((req.url ?? '').split('?')[0] as string, lastBody ?? {}, (req.url ?? '').includes('custom=1'));
     res.writeHead(200, { 'content-type': type });
     // Stream the payload in awkward 7-byte network chunks, so SSE events split across reads.
     for (const p of pieces(payload, 7)) res.write(p);
@@ -243,6 +260,19 @@ describe('OpenAI Responses (Codex)', () => {
     checkRestored(evs.find((e) => e.type === 'response.output_text.done').text, evs.find((e) => e.type === 'response.function_call_arguments.done').arguments);
     const done = evs.find((e) => e.type === 'response.completed').response.output;
     checkRestored(done[1].content[0].text, done[2].arguments);
+  });
+});
+
+describe('OpenAI Responses: custom tools (Codex apply_patch)', () => {
+  it('a streamed freeform tool input is restored as text, so the patch writes the real key', async () => {
+    const { text } = await call('/v1/responses?custom=1', { model: 'gpt-x', stream: true, input: userMessage });
+    upstreamNeverSawSecrets();
+    const evs = events(text);
+    const patch = evs.filter((e) => e.type === 'response.custom_tool_call_input.delta').map((e) => e.delta).join('');
+    assert.ok(patch.includes(`+OPENAI_API_KEY=${SECRET}\n`), patch);
+    assert.ok(!patch.includes('[[REDACTED'), 'no placeholder written to disk');
+    assert.equal(evs.find((e) => e.type === 'response.custom_tool_call_input.done').input, patch);
+    assert.equal(evs.find((e) => e.type === 'response.output_item.done').item.input, patch);
   });
 });
 
