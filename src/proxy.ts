@@ -12,10 +12,11 @@
  * rebinding), sends no CORS headers (a web page cannot read responses), and logs counts, never
  * bodies or values.
  */
+import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from 'node:zlib';
 import { apiFor, redactRequest, restoreResponse } from './body.ts';
-import { summarize, type RedactOptions } from './redact.ts';
+import { redactText, summarize, type RedactOptions } from './redact.ts';
 import { SseParser, SseRestorer, serialize } from './sse.ts';
 import type { Vault } from './vault.ts';
 import { VERSION } from './version.ts';
@@ -32,8 +33,15 @@ export interface ProxyOptions {
   redact: RedactOptions & { note?: boolean };
   /** One line per request (counts only). */
   log?: (line: string) => void;
-  /** Largest request body accepted (bytes). */
+  /** Largest request body accepted (bytes) — also the limit for what a compressed body may inflate to. */
   maxBody?: number;
+  /** Forward bodies that cannot be redacted (multipart uploads, binary) instead of refusing them. */
+  allowUnredacted?: boolean;
+  /**
+   * Require this secret as the first path segment (`/<token>/anthropic/…`). Anyone who can reach the
+   * proxy could otherwise get a placeholder they have seen turned back into its value.
+   */
+  token?: string;
 }
 
 export interface ProxyStats {
@@ -61,20 +69,22 @@ async function readBody(req: IncomingMessage, max: number): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-function decompress(buf: Buffer, encoding: string | undefined): Buffer {
+/** Decompress, never beyond `max` bytes (a 1 MB gzip bomb must not inflate to a gigabyte). */
+function decompress(buf: Buffer, encoding: string | undefined, max: number): Buffer {
+  const o = { maxOutputLength: max };
   switch ((encoding ?? '').toLowerCase().trim()) {
     case '':
     case 'identity':
       return buf;
     case 'gzip':
     case 'x-gzip':
-      return gunzipSync(buf);
+      return gunzipSync(buf, o);
     case 'deflate':
-      return inflateSync(buf);
+      return inflateSync(buf, o);
     case 'br':
-      return brotliDecompressSync(buf);
+      return brotliDecompressSync(buf, o);
     case 'zstd':
-      return zstdDecompressSync(buf);
+      return zstdDecompressSync(buf, o);
     default:
       throw Object.assign(new Error(`unsupported content-encoding ${encoding}`), { status: 415 });
   }
@@ -85,41 +95,78 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
   const maxBody = opts.maxBody ?? 64 * 1024 * 1024;
   const log = opts.log ?? (() => {});
 
-  const server = createServer(async (req, res) => {
+  // One request must never take the proxy down (and with it every agent using it).
+  const server = createServer((req, res) => {
+    handle(req, res).catch((err: unknown) => {
+      log(`${req.method} ${req.url} -> internal error: ${(err as Error)?.message ?? err}`);
+      if (!res.headersSent) send(res, 500, { error: 'llm-redact internal error' });
+      else res.destroy();
+    });
+  });
+
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const t0 = Date.now();
     // DNS rebinding: a web page that resolves its own name to 127.0.0.1 still sends its own Host.
     if (!LOOPBACK_HOST.test(req.headers.host ?? '')) return send(res, 403, { error: 'llm-redact only accepts requests addressed to localhost' });
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    const [, name = '', ...rest] = url.pathname.split('/');
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      return send(res, 400, { error: 'bad request URL' });
+    }
+    let segments = url.pathname.split('/').slice(1);
+    if (opts.token) {
+      // Constant-time comparison: the token is a secret.
+      const given = Buffer.from(segments[0] ?? '');
+      const want = Buffer.from(opts.token);
+      if (given.length !== want.length || !timingSafeEqual(given, want)) return send(res, 403, { error: 'this llm-redact proxy requires its access token in the URL (see: llm-redact env)' });
+      segments = segments.slice(1);
+    }
+    const [name = '', ...rest] = segments;
     if (!name) return send(res, 200, { name: 'llm-redact', version: VERSION, upstreams: Object.keys(opts.upstreams), stats });
-    const base = opts.upstreams[name];
-    if (!base) return send(res, 404, { error: `unknown upstream "${name}"`, upstreams: Object.keys(opts.upstreams) });
+    // Own properties only: "__proto__" or "constructor" is not an upstream.
+    const base = Object.hasOwn(opts.upstreams, name) ? opts.upstreams[name] : undefined;
+    if (typeof base !== 'string') return send(res, 404, { error: `unknown upstream "${name}"`, upstreams: Object.keys(opts.upstreams) });
     const path = '/' + rest.join('/');
     const target = base.replace(/\/+$/, '') + path + url.search;
     const api = apiFor(path);
     stats.requests++;
 
+    // Fail closed: a body that cannot be redacted is refused, never forwarded as it came in.
     let body: Buffer | undefined;
     let note = '';
     const counts: Record<string, number> = {};
     try {
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         const raw = await readBody(req, maxBody);
-        const plain = decompress(raw, req.headers['content-encoding']);
-        body = plain;
-        if (/json/i.test(req.headers['content-type'] ?? '') || /^\s*[{[]/.test(plain.subarray(0, 64).toString('utf8'))) {
+        const plain = decompress(raw, req.headers['content-encoding'], maxBody);
+        const type = (req.headers['content-type'] ?? '').toLowerCase();
+        let text = plain.toString('utf8');
+        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // a BOM is not a reason to skip redaction
+        if (!plain.length) body = plain;
+        else if (/json/.test(type) || (!type && /^\s*[{[]/.test(text.slice(0, 64)))) {
+          let parsed: unknown;
           try {
-            const parsed: unknown = JSON.parse(plain.toString('utf8'));
-            const r = redactRequest(parsed, opts.vault, api, opts.redact);
-            Object.assign(counts, summarize(r.hits));
-            body = Buffer.from(JSON.stringify(r.body), 'utf8');
+            parsed = JSON.parse(text);
           } catch {
-            note = ' (body not JSON: passed through unredacted)';
+            throw Object.assign(new Error('request body is not valid JSON; llm-redact does not forward what it cannot redact'), { status: 400 });
           }
-        } else if (plain.length) note = ` (${req.headers['content-type'] ?? 'unknown'} body passed through unredacted)`;
+          const r = redactRequest(parsed, opts.vault, api, opts.redact);
+          Object.assign(counts, summarize(r.hits));
+          body = Buffer.from(JSON.stringify(r.body), 'utf8');
+        } else if (/^text\/|x-www-form-urlencoded/.test(type)) {
+          const r = redactText(text, opts.vault, opts.redact);
+          Object.assign(counts, summarize(r.hits));
+          body = Buffer.from(r.text, 'utf8');
+        } else if (opts.allowUnredacted) {
+          body = plain;
+          note = ` (${type || 'untyped'} body forwarded UNREDACTED: --allow-unredacted)`;
+        } else throw Object.assign(new Error(`cannot redact a ${type || 'untyped'} body (file uploads, binary); refusing to forward it. Start llm-redact with --allow-unredacted to forward such bodies as they are.`), { status: 415 });
       }
     } catch (err) {
-      return send(res, (err as { status?: number }).status ?? 400, { error: (err as Error).message });
+      const status = (err as { status?: number }).status ?? (/maxOutputLength|buffer|too large|nested deeper/i.test((err as Error).message) ? 413 : 400);
+      log(`${req.method} /${name}${path} -> refused (${status}): ${(err as Error).message}`);
+      return send(res, status, { error: (err as Error).message });
     }
     for (const [k, n] of Object.entries(counts)) stats.redacted[k] = (stats.redacted[k] ?? 0) + n;
 
@@ -144,6 +191,19 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
     upstream.headers.forEach((v, k) => {
       if (!HOP.has(k.toLowerCase())) outHeaders[k] = v;
     });
+    // A redirect would make the client re-send its ORIGINAL (unredacted) body to wherever it points.
+    // Within this upstream: point it back through the proxy. Anywhere else: refuse.
+    if (upstream.status >= 300 && upstream.status < 400 && outHeaders.location) {
+      const loc = new URL(outHeaders.location, target);
+      const root = base.replace(/\/+$/, '');
+      if (loc.href.startsWith(root + '/') || loc.href === root) {
+        outHeaders.location = `http://${req.headers.host}/${opts.token ? `${opts.token}/` : ''}${name}${loc.href.slice(root.length)}`;
+      } else {
+        await upstream.body?.cancel();
+        log(`${req.method} /${name}${path} -> refused redirect to ${loc.origin}`);
+        return send(res, 502, { error: `upstream redirected to ${loc.origin}; llm-redact does not let clients follow redirects past it` });
+      }
+    }
     const type = upstream.headers.get('content-type') ?? '';
     try {
       if (/text\/event-stream/i.test(type) && upstream.body) {
@@ -178,6 +238,6 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
     }
     const summary = Object.entries(counts).map(([k, n]) => `${k} x${n}`).join(' ');
     log(`${req.method} /${name}${path} -> ${upstream.status} ${Date.now() - t0}ms${summary ? `  redacted ${summary}` : ''}${note}`);
-  });
+  }
   return Object.assign(server, { stats });
 }

@@ -61,7 +61,8 @@ const isObj = (v: unknown): v is Json => typeof v === 'object' && v !== null && 
 /** Rewrites events of one response stream. One instance per HTTP response. */
 export class SseRestorer {
   private readonly vault: Vault;
-  private readonly api: Api;
+  /** From the request path; for an unknown path, settled by the first event that says which format it is. */
+  private api: Api;
   private readonly restorers = new Map<string, StreamRestorer>();
   private lastChat: Json | null = null;
 
@@ -97,6 +98,7 @@ export class SseRestorer {
       return [e];
     }
     if (!isObj(d)) return [e];
+    if (this.api === 'other') this.api = sniff(d);
     const out = this.api === 'anthropic' ? this.anthropic(d, e.head) : this.api === 'chat' ? this.chat(d, e.head) : this.api === 'responses' ? this.responses(d, e.head) : [restoreResponse(d, this.vault) as Json];
     return out.map((x) => ('head' in x && 'data' in x ? (x as unknown as Event) : { head: e.head, data: JSON.stringify(x) }));
   }
@@ -130,7 +132,8 @@ export class SseRestorer {
       const delta = this.toolBlocks.has(idx) ? { type: 'input_json_delta', partial_json: tail } : { type: 'text_delta', text: tail };
       return [{ head: replaceEvent(head, 'content_block_delta'), data: JSON.stringify({ type: 'content_block_delta', index: d.index, delta }) }, d];
     }
-    return [d];
+    // Everything else (message_start, message_delta, error, …): whole objects, restored as such.
+    return [restoreResponse(d, this.vault) as Json];
   }
   /** Anthropic block indexes that are tool calls (their deltas are partial JSON). */
   private readonly toolBlocks = new Set<string>();
@@ -145,6 +148,8 @@ export class SseRestorer {
       const delta = isObj(c.delta) ? { ...c.delta } : null;
       if (delta) {
         if (typeof delta.content === 'string') delta.content = this.restorer(`c${ci}`, false).push(delta.content);
+        // The legacy `function_call` (before tool_calls) streams JSON arguments the same way.
+        if (isObj(delta.function_call) && typeof delta.function_call.arguments === 'string') delta.function_call = { ...delta.function_call, arguments: this.restorer(`l${ci}`, true).push(delta.function_call.arguments) };
         if (Array.isArray(delta.tool_calls))
           delta.tool_calls = delta.tool_calls.map((tc) => {
             if (!isObj(tc)) return tc;
@@ -164,6 +169,8 @@ export class SseRestorer {
   private drainChoice(ci: string, delta: Json): void {
     const text = this.take(`c${ci}`);
     if (text) delta.content = (typeof delta.content === 'string' ? delta.content : '') + text;
+    const legacy = this.take(`l${ci}`);
+    if (legacy) delta.function_call = { ...(isObj(delta.function_call) ? delta.function_call : {}), arguments: (isObj(delta.function_call) && typeof delta.function_call.arguments === 'string' ? delta.function_call.arguments : '') + legacy };
     for (const key of [...this.restorers.keys()].filter((k) => k.startsWith(`t${ci}.`) || k.startsWith(`u${ci}.`))) {
       const tail = this.take(key);
       if (!tail) continue;
@@ -178,7 +185,7 @@ export class SseRestorer {
     if (!this.restorers.size || !this.lastChat) return [];
     const byChoice = new Map<string, Json>();
     for (const key of [...this.restorers.keys()]) {
-      const ci = key.startsWith('c') ? key.slice(1) : key.slice(1, key.indexOf('.'));
+      const ci = key.startsWith('c') || key.startsWith('l') ? key.slice(1) : key.slice(1, key.indexOf('.'));
       if (!byChoice.has(ci)) byChoice.set(ci, {});
       this.drainChoice(ci, byChoice.get(ci) as Json);
     }
@@ -216,6 +223,17 @@ export class SseRestorer {
     return [d];
   }
 
+}
+
+const ANTHROPIC_EVENTS = new Set(['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop', 'ping', 'error']);
+
+/** Which wire format an event belongs to (for streams on a path we did not recognise). */
+function sniff(d: Json): Api {
+  const t = typeof d.type === 'string' ? d.type : '';
+  if (ANTHROPIC_EVENTS.has(t)) return 'anthropic';
+  if (t.startsWith('response.')) return 'responses';
+  if (Array.isArray(d.choices) || d.object === 'chat.completion.chunk') return 'chat';
+  return 'other';
 }
 
 /** The same head lines with `event:` set to `name` (if the stream uses event: lines at all). */

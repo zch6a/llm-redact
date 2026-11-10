@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseArgs, type ParseArgsConfig } from 'node:util';
 import { DETECTORS } from './detectors.ts';
@@ -26,6 +27,8 @@ Options
       --enable <ids>         optional detectors to turn on: ipv4
       --allow <value>        a value never to redact (repeatable)
       --no-note              do not tell the model what the placeholders are
+      --require-token        only answer under a random path token (for machines with other users)
+      --allow-unredacted     forward bodies that cannot be redacted (uploads) instead of refusing them
       --config <file>        settings file (default: ${join(dirname(defaultKeyPath()), 'config.json')})
   -q, --quiet                no request log
       --json                 scan: machine-readable output
@@ -42,6 +45,8 @@ const OPTIONS = {
   enable: { type: 'string', multiple: true },
   allow: { type: 'string', multiple: true },
   'no-note': { type: 'boolean' },
+  'allow-unredacted': { type: 'boolean' },
+  'require-token': { type: 'boolean' },
   config: { type: 'string' },
   quiet: { type: 'boolean', short: 'q' },
   json: { type: 'boolean' },
@@ -56,11 +61,28 @@ class UsageError extends Error {}
 
 interface Config {
   port: number;
+  token?: string;
+  allowUnredacted: boolean;
   upstreams: Record<string, string>;
   redact: RedactOptions & { note?: boolean };
 }
 
 const list = (v: string[] | undefined) => (v ?? []).flatMap((s) => s.split(',')).map((s) => s.trim()).filter(Boolean);
+
+/** The access token for --require-token: random, created once, next to the HMAC key. */
+function loadToken(): string {
+  const file = join(dirname(defaultKeyPath()), 'token');
+  try {
+    const t = readFileSync(file, 'utf8').trim();
+    if (/^[0-9a-f]{32}$/.test(t)) return t;
+  } catch {
+    // first use
+  }
+  const t = randomBytes(16).toString('hex');
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, t + '\n', { mode: 0o600 });
+  return t;
+}
 
 /** Defaults ← config file ← command line. */
 export function loadConfig(v: Values): Config {
@@ -84,20 +106,21 @@ export function loadConfig(v: Values): Config {
   for (const id of [...disable, ...enable]) if (!known.has(id)) throw new UsageError(`unknown detector "${id}" (see: llm-redact detectors)`);
   const port = Number(v.port ?? fileCfg.port ?? 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`bad port ${v.port}`);
-  return { port, upstreams, redact: { disable, enable, allow: [...strs(fileCfg.allow), ...(v.allow ?? [])], note: v['no-note'] ? false : fileCfg.note !== false } };
+  const requireToken = !!v['require-token'] || fileCfg.requireToken === true;
+  return { port, upstreams, allowUnredacted: !!v['allow-unredacted'] || fileCfg.allowUnredacted === true, ...(requireToken ? { token: loadToken() } : {}), redact: { disable, enable, allow: [...strs(fileCfg.allow), ...(v.allow ?? [])], note: v['no-note'] ? false : fileCfg.note !== false } };
 }
 
 function cmdStart(v: Values): Promise<number> {
   const cfg = loadConfig(v);
   const vault = new Vault(loadKey());
-  const server = createProxy({ vault, upstreams: cfg.upstreams, redact: cfg.redact, log: v.quiet ? undefined : (l) => console.log(l) });
+  const server = createProxy({ vault, upstreams: cfg.upstreams, redact: cfg.redact, allowUnredacted: cfg.allowUnredacted, ...(cfg.token ? { token: cfg.token } : {}), log: v.quiet ? undefined : (l) => console.log(l) });
   return new Promise((resolveExit) => {
     server.on('error', (err: NodeJS.ErrnoException) => {
       console.error(err.code === 'EADDRINUSE' ? `Port ${cfg.port} is in use — is llm-redact already running? Try --port.` : err.message);
       resolveExit(1);
     });
     server.listen(cfg.port, '127.0.0.1', () => {
-      console.log(`llm-redact ${VERSION} listening on http://127.0.0.1:${cfg.port}`);
+      console.log(`llm-redact ${VERSION} listening on http://127.0.0.1:${cfg.port}${cfg.token ? '/<token> (--require-token: see llm-redact env)' : ''}`);
       // ASCII only: this is the first thing people see, often in a console that is not UTF-8.
       for (const [name, url] of Object.entries(cfg.upstreams)) console.log(`  /${name.padEnd(10)} -> ${url}`);
       console.log(`Run \`llm-redact env\` to see what to set in your agent. Ctrl+C to stop.`);
@@ -123,8 +146,8 @@ function setVar(shell: Shell, name: string, value: string): string {
   return `export ${name}=${value}`;
 }
 
-export function envText(client: string, port: number, shell: Shell, current: NodeJS.ProcessEnv = process.env): string {
-  const base = `http://127.0.0.1:${port}`;
+export function envText(client: string, port: number, shell: Shell, current: NodeJS.ProcessEnv = process.env, token?: string): string {
+  const base = `http://127.0.0.1:${port}${token ? `/${token}` : ''}`;
   const out: string[] = [];
   const want = (c: string) => client === 'all' || client === c;
   if (want('claude')) {
@@ -179,7 +202,8 @@ async function cmdStats(v: Values): Promise<number> {
   const port = loadConfig(v).port;
   let s: { version?: string; stats?: { requests: number; redacted: Record<string, number> } };
   try {
-    s = (await (await fetch(`http://127.0.0.1:${port}/`)).json()) as typeof s;
+    const cfg = loadConfig(v);
+    s = (await (await fetch(`http://127.0.0.1:${port}/${cfg.token ? `${cfg.token}/` : ''}`)).json()) as typeof s;
   } catch {
     console.error(`No llm-redact proxy answering on port ${port}. Start it with \`llm-redact\`.`);
     return 1;
@@ -225,7 +249,8 @@ export async function main(argv: string[]): Promise<number> {
       case 'env': {
         const shell = (v.shell ?? (process.platform === 'win32' ? 'powershell' : 'bash')) as Shell;
         if (!['bash', 'zsh', 'fish', 'powershell', 'cmd'].includes(shell)) throw new UsageError(`unknown shell ${shell}`);
-        console.log(envText(rest[0] ?? 'all', loadConfig(v).port, shell));
+        const cfg = loadConfig(v);
+        console.log(envText(rest[0] ?? 'all', cfg.port, shell, process.env, cfg.token));
         return 0;
       }
       case 'scan':

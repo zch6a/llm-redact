@@ -87,7 +87,9 @@ npx llm-redact env      # 按你的 shell 打印每个客户端要设置什么
 - **带签名的块原样保留。** Anthropic 的 thinking 块和 OpenAI 的加密推理会被服务商逐字节校验，两个方向都绝不修改。
 - **告诉模型发生了什么。** 请求里有占位符时，会在系统提示词末尾追加一句说明（让模型原样写出占位符，而不是向你要 key）。追加在末尾不会破坏已缓存的前缀。`--no-note` 可关闭。
 
-支持的接口格式：Anthropic Messages、OpenAI Chat Completions、OpenAI Responses——流式和非流式都支持。其他格式原样转发，并在日志里注明。
+- **出错时宁可拒绝（fail closed）。** 无法脱敏的请求体会被拒绝，绝不原样转发：不合法的 JSON → 400，嵌套深得离谱、或压缩后解压超过上限 → 413，文件上传等二进制内容 → 415（用 `--allow-unredacted` 启动可以让这类请求原样转发，日志会逐条标注）。纯文本请求体按文本脱敏。重定向到同一上游以外的地址会被拒绝，因为客户端会把原始的、未脱敏的请求体重新发到那里。
+
+支持的接口格式：Anthropic Messages（也包括经 Vertex AI 的 `:streamRawPredict`）、OpenAI Chat Completions、OpenAI Responses——流式和非流式都支持，包括工具输入、历史工具调用参数和 Codex 的自定义工具。其他 JSON 请求体按通用方式脱敏（所有字符串），未识别路径上的流式响应由第一个事件判断格式。
 
 ## 命令
 
@@ -99,21 +101,23 @@ npx llm-redact env      # 按你的 shell 打印每个客户端要设置什么
 | `llm-redact detectors` | 列出检测器 |
 | `llm-redact stats` | 正在运行的代理截至目前替换了多少个值（只显示数量） |
 
-选项：`--upstream name=url`（可重复）· `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--config file` · `-q`。配置文件（与密钥同目录的 `config.json`）支持同样的设置：`{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [] }`。
+选项：`--upstream name=url`（可重复）· `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--require-token` · `--allow-unredacted` · `--config file` · `-q`。配置文件（与密钥同目录的 `config.json`）支持同样的设置：`{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [], "requireToken": false, "allowUnredacted": false }`。
 
 请求日志只显示数量——`POST /anthropic/v1/messages -> 200 1834ms  redacted openai_key x1 email x2`——从不显示请求体或具体值。
 
 ## 安全
 
 - **只监听 127.0.0.1**，并拒绝 `Host` 不是回环地址的请求（防止网页通过 DNS 重绑定访问）。不返回 CORS 头：浏览器里的网页读不到它的响应。
-- 除了 HMAC 密钥（权限 600）之外不写任何文件。没有遥测，除了你配置的上游之外不产生任何网络流量。
+- **多人共用的机器上请加 `--require-token`。** 本机任何能连上这个端口的进程，都能让代理把它见过的占位符还原成真实值（代理对响应做的正是这件事）。加上这个参数后，代理只响应带随机路径令牌的地址（`http://127.0.0.1:8787/<token>/anthropic`），`llm-redact env` 会打印带令牌的地址。
+- 除了 HMAC 密钥和（使用 `--require-token` 时的）令牌（权限都是 600）之外不写任何文件。没有遥测，除了你配置的上游之外不产生任何网络流量。
 - 零运行时依赖——经手你密钥的代码，就是这个仓库里的代码。
 
 ## 局限——请务必读一下
 
 - **基于模式匹配。** 没有可识别形态、周围也没有提示性名字的密钥（句子中间的 `hunter2`）识别不出来。人名、地址和自由文本里的个人信息不在检测范围内。可以用 `scan` 看看你自己的文件会变成什么样。
-- **只处理请求体。** Agent 以 `multipart/form-data` 上传的文件、以及任何非 JSON 内容都原样转发（日志里会注明）。
+- **上传的文件不脱敏。** 以 `multipart/form-data` 或其他二进制形式发送的内容会被拒绝；如果传了 `--allow-unredacted`，则原样发出。
 - **只管经过代理的流量。** Agent 自己运行的工具（网页抓取、`curl`）不经过它。
+- **占位符在你这边被还原——不管是谁写的。** 这是设计本身：模型把 `[[REDACTED:…]]` 写进命令或文件，真实值落到你的机器上。这也意味着被提示注入（网页、README、工具结果）劫持的 agent 仍可能被诱导去使用还原后的密钥——比如用 `curl` 把它发到别处。llm-redact 让密钥不进入*服务商*，但并不能让一个够得着密钥的 agent 变得安全。
 - 模型看到的是占位符，所以它无法根据密钥的*内容*推理（比如“这是测试环境还是生产环境的 key？”）。这正是目的所在。
 
 ## 运行要求

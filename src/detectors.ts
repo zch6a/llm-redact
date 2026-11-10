@@ -22,6 +22,8 @@ export interface Detector {
   /** Capture group holding the value (0 = whole match); with a list, the first group that matched. */
   group?: number | number[];
   validate?: (value: string, match: RegExpExecArray) => boolean;
+  /** Removed from the end of the value (trailing punctuation), instead of a lookahead that backtracks. */
+  trimEnd?: RegExp;
   /** Off unless enabled explicitly (too noisy for most code). */
   optional?: boolean;
 }
@@ -120,14 +122,14 @@ const EXAMPLE_EMAIL = /@(example\.(com|org|net)|[\w-]+\.(example|test|invalid|lo
 /** Ordered: earlier detectors win where matches overlap (specific before generic). */
 export const DETECTORS: Detector[] = [
   // ---- private keys and connection strings
-  { id: 'private_key', kind: 'secret', description: 'PEM private key block', re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----[\s\S]{20,16000}?-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----/g },
+  { id: 'private_key', kind: 'secret', description: 'PEM private key block (also when truncated before its END line)', re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]{20,16000}?-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----|(?:\r?\n[A-Za-z0-9+/=]{4,200}){1,400})/g },
   // ---- provider tokens (fixed prefixes: very low false-positive rate)
   { id: 'anthropic_key', kind: 'secret', description: 'Anthropic API key', re: /\bsk-ant-[A-Za-z0-9_-]{20,200}/g },
   { id: 'openai_key', kind: 'secret', description: 'OpenAI / DeepSeek / compatible API key (sk-…)', re: /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,200}/g, validate: (v) => !v.startsWith('sk-ant-') && looksReal(v.slice(3)) },
   { id: 'github_token', kind: 'secret', description: 'GitHub token', re: /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{60,255})\b/g },
   { id: 'gitlab_token', kind: 'secret', description: 'GitLab token', re: /\bgl(?:pat|dt|ptt|rt)-[A-Za-z0-9_-]{20,64}\b/g },
   { id: 'aws_access_key', kind: 'secret', description: 'AWS access key id', re: /\b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}\b/g },
-  { id: 'aws_secret_key', kind: 'secret', description: 'AWS secret access key (next to its name)', re: /\baws_?secret_?access_?key["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})\b/gi, group: 1 },
+  { id: 'aws_secret_key', kind: 'secret', description: 'AWS secret access key (next to its name)', re: /\baws_?secret_?access_?key["']?\s{0,5}[:=]\s{0,5}["']?([A-Za-z0-9/+=]{40})\b/gi, group: 1 },
   { id: 'google_api_key', kind: 'secret', description: 'Google API key', re: /\bAIza[0-9A-Za-z_-]{35}\b/g },
   { id: 'slack_token', kind: 'secret', description: 'Slack token', re: /\bxox[abposr]-[A-Za-z0-9-]{10,250}\b/g },
   { id: 'slack_webhook', kind: 'secret', description: 'Slack incoming webhook', re: /https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{6,20}\/B[A-Z0-9]{6,20}\/[A-Za-z0-9]{20,40}/g },
@@ -138,8 +140,8 @@ export const DETECTORS: Detector[] = [
   { id: 'telegram_bot_token', kind: 'secret', description: 'Telegram bot token', re: /\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b/g },
   { id: 'jwt', kind: 'secret', description: 'JSON Web Token', re: /\beyJ[A-Za-z0-9_-]{10,2000}\.eyJ[A-Za-z0-9_-]{10,4000}\.[A-Za-z0-9_-]{10,2000}/g },
   // After the provider tokens: a GitHub token used as a URL password keeps its specific label.
-  { id: 'url_password', kind: 'secret', description: 'Password inside a URL (postgres://user:PASSWORD@host)', re: /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@'"`]{1,100}:([^\s@/'"`]{3,200})@[^\s/'"`]{1,200}/gi, group: 1, validate: (v) => !/^\$\{?\w+\}?$|^\*+$|^(password|passwd|pass|pwd|secret|test|testing|postgres|root|admin|user|guest|example|changeme|dev|local|mysql|redis|app)$/i.test(v) && !/^\[\[REDACTED:|^\[?REDACTED\]?$/i.test(v) },
-  { id: 'bearer_token', kind: 'secret', description: 'Bearer token in an Authorization header', re: /\b(?:Authorization|authorization)["']?\s*[:=]\s*["']?Bearer\s+([A-Za-z0-9._~+/=-]{16,2000})/g, group: 1, validate: (v) => looksReal(v) },
+  { id: 'url_password', kind: 'secret', description: 'Password inside a URL (postgres://user:PASSWORD@host)', re: /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@'"`]{1,100}:([^\s@/'"`]{3,200})@[^\s/'"`,;@]{1,200}/gi, group: 1, validate: (v) => !/^\$\{?\w+\}?$|^\*+$|^(password|passwd|pass|pwd|secret|test|testing|postgres|root|admin|user|guest|example|changeme|dev|local|mysql|redis|app)$/i.test(v) && !/^\[\[REDACTED:|^\[?REDACTED\]?$/i.test(v) },
+  { id: 'bearer_token', kind: 'secret', description: 'Bearer token in an Authorization header', re: /\b(?:Authorization|authorization)["']?\s{0,5}[:=]\s{0,5}["']?Bearer\s{1,5}([A-Za-z0-9._~+/=-]{16,2000})/g, group: 1, validate: (v) => looksReal(v) },
 
   // ---- generic: NAME=value where the name says secret and the value looks generated
   {
@@ -148,7 +150,8 @@ export const DETECTORS: Detector[] = [
     description: 'Value assigned to a name like *_SECRET, *_TOKEN, *PASSWORD, *_API_KEY',
     // The value: quoted (to the closing quote, honouring backslash escapes, so `"a\"b"` is one value)
     // or unquoted (to whitespace: quotes *inside* an unquoted .env value are part of it).
-    re: /\b([A-Za-z0-9_.-]{0,40}(?:secret|token|passwd|password|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}(?:"((?:[^"\\\n]|\\.){8,400})"|'((?:[^'\\\n]|\\.){8,400})'|`([^`\n]{8,400})`|([^\s"'`<>({\[][^\s]{7,399}?)(?=[,;)}\]]*(?:\s|$)))/gi,
+    re: /\b([A-Za-z0-9_.-]{0,100}(?:secret|token|passwd|password|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}(?:"((?:[^"\\\n]|\\.){8,400})"|'((?:[^'\\\n]|\\.){8,400})'|`([^`\n]{8,400})`|([^\s"'`<>({\[\\](?:[^\s\\]|\\(?![nrt])){7,399}))/gi,
+    trimEnd: /[,;)}\]]+$/,
     group: [2, 3, 4, 5],
     validate: (v, m) => {
       const name = (m[1] as string).toLowerCase();
@@ -165,7 +168,7 @@ export const DETECTORS: Detector[] = [
   { id: 'cn_mobile', kind: 'pii', description: 'Chinese mobile number', re: /(?<![\dA-Za-z+.-])(?:\+?86[ -]?)?1[3-9]\d[ -]?\d{4}[ -]?\d{4}(?![\dA-Za-z])/g },
   { id: 'phone', kind: 'pii', description: 'Phone number in international format (+1 415 555 0100)', re: /(?<![\w+])\+[1-9]\d{0,2}[ .-]?\(?\d{1,4}\)?(?:[ .-]?\d{2,4}){2,4}(?![\w])/g, validate: (v) => v.replace(/\D/g, '').length >= 9 && v.replace(/\D/g, '').length <= 15 },
   // Not the digits of a decimal (65.4545454545454 passes Luhn by chance) or of a longer number.
-  { id: 'credit_card', kind: 'pii', description: 'Payment card number (Luhn validated)', re: /(?<![\d.,-])(?:\d[ -]?){12,18}\d(?![\d-]|[.,]\d)/g, validate: (v) => {
+  { id: 'credit_card', kind: 'pii', description: 'Payment card number (Luhn validated)', re: /(?<![\d.,-])(?:\d{4}([ -])\d{4}\1\d{4}\1\d{4}|\d{4}([ -])\d{6}\2\d{5}|\d{13,19})(?![\d-]|[.,]\d)/g, validate: (v) => {
     const d = v.replace(/\D/g, '');
     return d.length >= 13 && d.length <= 19 && /^(4|5[1-5]|2[2-7]|3[47]|6(011|5|4[4-9]|22)|35|62)/.test(d) && luhn(d) && !/^(\d)\1+$/.test(d);
   } },

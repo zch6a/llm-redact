@@ -22,20 +22,32 @@ import type { Vault } from './vault.ts';
 export type Api = 'anthropic' | 'chat' | 'responses' | 'other';
 
 export function apiFor(path: string): Api {
-  if (/\/messages(\?|$)/.test(path)) return 'anthropic';
-  if (/\/chat\/completions(\?|$)/.test(path)) return 'chat';
-  if (/\/responses(\?|$)/.test(path)) return 'responses';
+  const p = path.split('?')[0] as string;
+  // Anthropic directly or through Vertex AI (…/models/claude-x:streamRawPredict).
+  if (/\/messages\/?$/.test(p) || /:(stream)?rawPredict$/i.test(p)) return 'anthropic';
+  if (/\/chat\/completions\/?$/.test(p)) return 'chat';
+  if (/\/responses\/?$/.test(p)) return 'responses';
   return 'other';
 }
 
-/** Keys whose string values are structure, not content. */
-const STRUCTURAL = new Set(['id', 'model', 'role', 'type', 'name', 'tool_name', 'namespace', 'phase', 'tool_use_id', 'tool_call_id', 'call_id', 'item_id', 'previous_response_id', 'stop_reason', 'finish_reason', 'stop_sequence', 'stop_sequences', 'stop', 'media_type', 'format', 'detail', 'object', 'status', 'signature', 'encrypted_content', 'cache_control', 'service_tier', 'reasoning_effort', 'user', 'safety_identifier', 'prompt_cache_key']);
-/** Keys whose whole subtree is left alone. */
-const OPAQUE = new Set(['tools', 'tool_choice', 'functions', 'function_call', 'response_format', 'text_format', 'metadata', 'cache_control', 'reasoning', 'thinking', 'container']);
-/** Block / item types that are signed or binary. */
-const OPAQUE_TYPES = new Set(['thinking', 'redacted_thinking', 'reasoning', 'image', 'input_image', 'input_audio', 'audio', 'image_url', 'file', 'input_file']);
+/**
+ * Keys whose string values are API structure — but only in the API's own envelope. Inside a tool
+ * call's input or arguments everything is user data: `{"user": "li.wei@…"}` there is content.
+ */
+const STRUCTURAL = new Set(['id', 'model', 'role', 'type', 'name', 'tool_name', 'namespace', 'phase', 'tool_use_id', 'tool_call_id', 'call_id', 'item_id', 'previous_response_id', 'stop_reason', 'finish_reason', 'stop_sequence', 'stop_sequences', 'stop', 'media_type', 'format', 'detail', 'object', 'status', 'signature', 'encrypted_content', 'service_tier', 'reasoning_effort', 'safety_identifier', 'prompt_cache_key', 'file_id', 'container_upload']);
+/**
+ * Top-level request fields left alone: tool definitions (schemas the client wrote), settings, and
+ * `mcp_servers` (its `authorization_token` is for the provider, like the API key in the header).
+ */
+const OPAQUE_TOP = new Set(['tools', 'tool_choice', 'functions', 'response_format', 'text', 'metadata', 'reasoning', 'thinking', 'container', 'mcp_servers', 'stream_options', 'prediction']);
+/** Signed blocks: verified byte for byte by the provider, never changed in either direction. */
+const SIGNED_TYPES = new Set(['thinking', 'redacted_thinking', 'reasoning']);
 /** String fields that hold JSON text (tool-call arguments): restored values need JSON escaping there. */
 const JSON_TEXT = new Set(['arguments', 'partial_json']);
+/** Fields of a tool call whose value is the model's or the user's own data. */
+const FREE = new Set(['input']);
+/** Deeper than this is not an API request: refuse rather than overflow the stack. */
+const MAX_DEPTH = 500;
 
 export const NOTE =
   "Note from the user's local privacy proxy: some values in this conversation (keys, tokens, personal data) were replaced by placeholders like [[REDACTED:kind:id]] before being sent to you. Where such a value is needed — in code, commands or files — write the placeholder exactly as it appears; it is turned back into the real value on the user's machine. Do not ask for the real values or try to guess them.";
@@ -49,18 +61,37 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** A source / image_url that carries base64 or a data: URL. */
-function binary(o: Record<string, unknown>): boolean {
-  return o.type === 'base64' || (typeof o.url === 'string' && o.url.startsWith('data:'));
+/** A binary payload: a data: URL, or a long base64 string under a data-ish key. Only that field is skipped. */
+function isBinary(key: string, s: string): boolean {
+  if (s.startsWith('data:') && /^data:[\w.+/-]{1,100};base64,/.test(s)) return true;
+  return (key === 'data' || key === 'file_data' || key === 'b64_json') && s.length > 256 && /^[A-Za-z0-9+/=\r\n]+$/.test(s.slice(0, 4096));
 }
 
-function walk(v: unknown, fn: (s: string, key: string) => string, key = ''): unknown {
-  if (typeof v === 'string') return STRUCTURAL.has(key) ? v : fn(v, key);
-  if (Array.isArray(v)) return v.map((x) => walk(x, fn, key));
+export type Visit = (s: string, key: string, free: boolean) => string;
+
+/**
+ * Walk a body. `free`: inside a tool call's input / arguments, where every string — and every
+ * object key — is data, whatever its name.
+ */
+function walk(v: unknown, fn: Visit, key = '', free = false, depth = 0): unknown {
+  if (depth > MAX_DEPTH) throw new Error(`request nested deeper than ${MAX_DEPTH} levels`);
+  if (typeof v === 'string') {
+    if (isBinary(key, v)) return v;
+    return !free && STRUCTURAL.has(key) ? v : fn(v, key, free);
+  }
+  if (Array.isArray(v)) return v.map((x) => walk(x, fn, key, free, depth + 1));
   if (!isObject(v)) return v;
-  if ((typeof v.type === 'string' && OPAQUE_TYPES.has(v.type)) || binary(v)) return v;
+  if (!free && typeof v.type === 'string' && SIGNED_TYPES.has(v.type)) return v;
   const out: Record<string, unknown> = {};
-  for (const [k, x] of Object.entries(v)) out[k] = OPAQUE.has(k) ? x : walk(x, fn, k);
+  for (const [k, x] of Object.entries(v)) {
+    if (!free && depth === 0 && OPAQUE_TOP.has(k)) {
+      out[k] = x;
+      continue;
+    }
+    // In free zones object keys are data too (`{"li.wei@corp-mail.cn": "admin"}`).
+    const name = free ? fn(k, '', true) : k;
+    out[name] = walk(x, fn, k, free || (FREE.has(k) && isObject(x)), depth + 1);
+  }
   return out;
 }
 
@@ -82,21 +113,24 @@ export function redactRequest(body: unknown, vault: Vault, api: Api, opts: Redac
     if (r.text.includes('[[REDACTED:')) sawPlaceholder = true;
     return r.text;
   };
-  const out = walk(body, (s, key) => {
-    // Tool-call arguments are JSON text: redact the values inside, not their escaped form. Only
-    // re-serialise when something changed, so untouched arguments stay byte-identical (cache).
+  const visit: Visit = (s, key) => {
+    // Tool-call arguments are JSON text: redact the values inside (as a free zone), not their
+    // escaped form. Only re-serialise when something changed, so untouched arguments stay
+    // byte-identical (prompt cache).
     if (JSON_TEXT.has(key)) {
       try {
         const parsed: unknown = JSON.parse(s);
         const before = hits.length;
-        const red = walk(parsed, text);
+        const red = walk(parsed, (x, k) => text(x, k), '', true);
         return hits.length > before ? JSON.stringify(red) : s;
-      } catch {
+      } catch (err) {
+        if ((err as Error).message.includes('nested deeper')) throw err;
         // not JSON after all: treat as text
       }
     }
     return text(s, key);
-  });
+  };
+  const out = walk(body, visit);
   if (sawPlaceholder && opts.note !== false && isObject(out)) addNote(out, api);
   return { body: out, hits };
 }
@@ -127,7 +161,7 @@ function addNote(body: Record<string, unknown>, api: Api): void {
 /** JSON-string escaping for a value restored inside JSON text (tool-call arguments). */
 export const jsonEncode = (value: string): string => JSON.stringify(value).slice(1, -1);
 
-/** Restore placeholders in a parsed (non-streamed) response body. */
+/** Restore placeholders in a parsed (non-streamed) response body — tool inputs, keys and arguments included. */
 export function restoreResponse(body: unknown, vault: Vault): unknown {
   return walk(body, (s, key) => vault.restore(s, JSON_TEXT.has(key) ? jsonEncode : undefined));
 }

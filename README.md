@@ -89,7 +89,9 @@ Measured, not assumed: over 2,955 real files (five popular public skill reposito
 - **Signed blocks are left alone.** Anthropic thinking blocks and OpenAI encrypted reasoning are verified byte for byte by the provider; they are never modified in either direction.
 - **The model is told.** When a request contains placeholders, one sentence is appended to the end of the system prompt explaining them (so it writes them verbatim instead of asking for the key). Appending at the end keeps cached prefixes intact. `--no-note` turns it off.
 
-Supported wire formats: Anthropic Messages, OpenAI Chat Completions, OpenAI Responses — streamed and not. Anything else is passed through with a note in the log.
+- **Fails closed.** A body it cannot redact is refused, never forwarded as it came: invalid JSON → 400, absurd nesting or a compressed body that inflates past the limit → 413, an upload or other binary body → 415 (start with `--allow-unredacted` to forward those as they are; the log marks each one). Plain-text bodies are redacted as text. A redirect to anywhere but the same upstream is refused, because the client would re-send its original, unredacted body there.
+
+Supported wire formats: Anthropic Messages (also through Vertex AI's `:streamRawPredict`), OpenAI Chat Completions, OpenAI Responses — streamed and not, including tool inputs, earlier tool-call arguments and Codex's custom tools. Other JSON bodies are redacted generically (every string), and a stream on an unrecognised path is identified by its first event.
 
 ## Commands
 
@@ -101,21 +103,23 @@ Supported wire formats: Anthropic Messages, OpenAI Chat Completions, OpenAI Resp
 | `llm-redact detectors` | List detectors |
 | `llm-redact stats` | What a running proxy has redacted so far (counts only) |
 
-Options: `--upstream name=url` (repeatable) · `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--config file` · `-q`. A config file (`config.json` next to the key) takes the same settings: `{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [] }`.
+Options: `--upstream name=url` (repeatable) · `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--require-token` · `--allow-unredacted` · `--config file` · `-q`. A config file (`config.json` next to the key) takes the same settings: `{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [], "requireToken": false, "allowUnredacted": false }`.
 
 The request log shows counts only — `POST /anthropic/v1/messages -> 200 1834ms  redacted openai_key x1 email x2` — never bodies or values.
 
 ## Security
 
 - Listens on **127.0.0.1 only** and rejects requests whose `Host` is not loopback (no DNS rebinding from a web page). No CORS headers: a browser page cannot read its responses.
-- Nothing is written to disk except the HMAC key (created with mode 600). No telemetry, no other network traffic than the upstream you configured.
+- **On a machine with other users, use `--require-token`.** Any local process that can reach the port can ask the proxy to turn a placeholder it has seen back into its value (that is what the proxy does for responses). With the flag the proxy answers only under a random path token (`http://127.0.0.1:8787/<token>/anthropic`); `llm-redact env` prints the URL with it.
+- Nothing is written to disk except the HMAC key and, with `--require-token`, the token (both created with mode 600). No telemetry, no other network traffic than the upstream you configured.
 - Zero runtime dependencies — the code that sees your secrets is the code in this repository.
 
 ## Limits — read this
 
 - **Pattern-based.** A secret with no recognisable shape and no telling name around it (`hunter2` in the middle of a sentence) is not found. Names of people, addresses and free-text personal details are not detected. Use `scan` to see what your own files look like.
-- **Bodies only.** Files the agent uploads as `multipart/form-data` and anything that is not JSON are passed through unchanged (the log says so).
+- **Uploads are not redacted.** Files sent as `multipart/form-data` or other binary bodies are refused unless you pass `--allow-unredacted`, in which case they go out as they are.
 - **Only what goes through the proxy.** Tools the agent runs itself (a web fetch, a `curl`) are outside it.
+- **Placeholders are restored on your side — for whatever wrote them.** That is the design: the model writes `[[REDACTED:…]]` into a command or file and the real value lands on your machine. It also means an agent that has been prompt-injected (by a web page, a README, a tool result) can still be steered into using a restored secret — say, a `curl` that sends it somewhere. llm-redact keeps values away from the *provider*; it does not make an agent safe to run with secrets in reach.
 - The model sees placeholders, so it cannot reason about the *content* of a secret (e.g. "is this key for staging or production?"). That is the point.
 
 ## Requirements
