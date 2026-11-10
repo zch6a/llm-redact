@@ -2,6 +2,35 @@
 
 All notable changes are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.4.0] — 2026-11-11
+
+A third independent review, of the response side only, found 20 problems (19 reproduced). All are fixed, each with a test; every fix was undone once in a copy of the code to make sure the suite fails without it (24 mutations, all caught). A seeded property test now covers every streamed format.
+
+### Security
+
+- **Restored values were sent back in clear.** The model writes a placeholder somewhere new (`psql -W [[REDACTED:…]]`); the client gets the real password; next turn it sends that history back — and a value that was found by its *context* (`DB_PASSWORD=`, `Bearer`, URL passwords) has no context there. Such values are now remembered (8+ characters, the 5,000 most recent) and redacted wherever they appear, in every decoded view, with their original placeholder.
+- **Responses are bounded**: a response body over the body limit (64 MB) is refused, an SSE event or NDJSON line that never ends is cut off, and writes wait for slow clients (backpressure). The vault is bounded too (200,000 values, least recently used forgotten — they come back with the next request).
+- Reasoning is never restored, streamed or not, in any format — Responses `reasoning_text` parts, OpenRouter `reasoning.*` details (always passed back verbatim), unsigned Anthropic thinking, signed NDJSON lines — so no restored value can go back in clear inside a block the request side leaves alone.
+
+### Fixed
+
+- Placeholders are restored in Gemini streams (split across events), legacy completions / FIM streams (`choices[].text`), Responses refusals, MCP call arguments, annotations and `error` events, Anthropic citations, and `server_tool_use` / `mcp_tool_use` blocks.
+- Held-back text is no longer lost when a stream ends without its usual terminator (an `error` event, a missing `.done`, a cut connection).
+- Numbers in restored responses — streamed or not, SSE or NDJSON — are exactly as the upstream wrote them.
+- A tool parameter named `arguments` or `partial_json` is no longer JSON-escaped twice when restored.
+- Events the proxy inserts for held-back text carry no `id:` line and the next sequence number (later ones move up); a Chat flush chunk no longer repeats `usage`, and a tail goes into the finish chunk even when it has no `delta`.
+- The last event of a CR-only stream is delivered (restored) at the end; an event cut off without its blank line is passed on as the bytes it was, as a client would discard it.
+- NDJSON lines are no longer rescanned per chunk (8 MB line: 16 s → 18 ms).
+- An event that cannot be processed (absurd nesting) passes through instead of killing the stream; an unparseable JSON body is passed through instead of restored blindly.
+- Every `Set-Cookie` is kept; HEAD keeps `content-length`; untyped JSON and `text/*` responses are restored; a content-encoding fetch cannot decode passes through untouched; SSE and NDJSON headers go out immediately.
+- Keep-alive: idle connections are kept 65 s, so a client reusing one between turns no longer gets ECONNRESET.
+
+### Added
+
+- `llm-redact scan --body request.json`: which fields of an API request would change, and what was found in each (`--api`, `--json`); `docs/example-request.json` to try it on.
+- "Did you mean" for unknown commands and detectors; unreadable files are one line, not a stack trace.
+- CI runs the suite without `JSON.rawJSON` (the fallback path) and the built package on Node 22.15.
+
 ## [0.3.0] — 2026-11-11
 
 A second independent leak review, focused on what 0.2.0 changed, found 20 more problems (19 reproduced). All are fixed, each with a regression test; every fix was then undone once in a copy of the code to make sure some test fails without it.

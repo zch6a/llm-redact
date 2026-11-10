@@ -2,13 +2,14 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseArgs, type ParseArgsConfig } from 'node:util';
+import { parseJson, redactRequest, type Api } from './body.ts';
 import { DETECTORS } from './detectors.ts';
 import { DEFAULT_UPSTREAMS, createProxy } from './proxy.ts';
 import { redactText, summarize, type RedactOptions } from './redact.ts';
 import { Vault, defaultKeyPath, loadKey, writePrivate } from './vault.ts';
 import { VERSION } from './version.ts';
 
-const HELP = `llm-redact — keep API keys, tokens and personal data out of your AI agent's requests.
+const HELP = `llm-redact - keep API keys, tokens and personal data out of your AI agent's requests.
 
 A local proxy: requests are redacted before they leave your machine, responses are restored
 before your agent sees them, so it still writes the real key into your .env.
@@ -17,6 +18,7 @@ Usage
   llm-redact [start] [options]     run the proxy (default port 8787)
   llm-redact env [client]          what to set for claude, codex, openai, deepseek (default: all)
   llm-redact scan [file|-]         show what a file would look like after redaction
+  llm-redact scan --body req.json  which fields of an API request would change, and why
   llm-redact detectors             list what is detected
   llm-redact stats                 what a running proxy has redacted so far (counts only)
 
@@ -32,6 +34,8 @@ Options
       --config <file>        settings file (default: ${join(dirname(defaultKeyPath()), 'config.json')})
   -q, --quiet                no request log
       --json                 scan: machine-readable output
+      --body                 scan: the file is an API request body; show which fields would change
+      --api <name>           scan --body: anthropic, chat, responses or other (default: from its shape)
       --shell <name>         env: bash, zsh, fish, powershell, cmd (default: from your platform)
   -h, --help / --version
 
@@ -50,6 +54,8 @@ const OPTIONS = {
   config: { type: 'string' },
   quiet: { type: 'boolean', short: 'q' },
   json: { type: 'boolean' },
+  body: { type: 'boolean' },
+  api: { type: 'string' },
   shell: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean' },
@@ -58,6 +64,23 @@ const OPTIONS = {
 type Values = ReturnType<typeof parseArgs<{ options: typeof OPTIONS; allowPositionals: true }>>['values'];
 
 class UsageError extends Error {}
+
+const COMMANDS = ['start', 'env', 'scan', 'detectors', 'stats'];
+
+/** ` (did you mean "email"?)` for a near miss (edit distance 2 or less), else ''. */
+export function didYouMean(word: string, candidates: string[]): string {
+  const dist = (a: string, b: string): number => {
+    let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= b.length; j++) cur[j] = Math.min((prev[j] as number) + 1, (cur[j - 1] as number) + 1, (prev[j - 1] as number) + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    return prev[b.length] as number;
+  };
+  const best = candidates.map((c) => [c, dist(word.toLowerCase(), c)] as const).sort((x, y) => x[1] - y[1])[0];
+  return best && best[1] <= 2 && best[1] < word.length ? ` (did you mean "${best[0]}"?)` : '';
+}
 
 interface Config {
   port: number;
@@ -102,7 +125,7 @@ export function loadConfig(v: Values): Config {
   const known = new Set([...DETECTORS.map((d) => d.id), 'secret', 'pii']);
   const disable = [...strs(fileCfg.disable), ...list(v.disable)];
   const enable = [...strs(fileCfg.enable), ...list(v.enable)];
-  for (const id of [...disable, ...enable]) if (!known.has(id)) throw new UsageError(`unknown detector "${id}" (see: llm-redact detectors)`);
+  for (const id of [...disable, ...enable]) if (!known.has(id)) throw new UsageError(`unknown detector "${id}"${didYouMean(id, [...known])} (see: llm-redact detectors)`);
   const port = Number(v.port ?? fileCfg.port ?? 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`bad port ${v.port}`);
   const requireToken = !!v['require-token'] || fileCfg.requireToken === true;
@@ -115,7 +138,7 @@ function cmdStart(v: Values): Promise<number> {
   const server = createProxy({ vault, upstreams: cfg.upstreams, redact: cfg.redact, allowUnredacted: cfg.allowUnredacted, ...(cfg.token ? { token: cfg.token } : {}), log: v.quiet ? undefined : (l) => console.log(l) });
   return new Promise((resolveExit) => {
     server.on('error', (err: NodeJS.ErrnoException) => {
-      console.error(err.code === 'EADDRINUSE' ? `Port ${cfg.port} is in use — is llm-redact already running? Try --port.` : err.message);
+      console.error(err.code === 'EADDRINUSE' ? `Port ${cfg.port} is in use - is llm-redact already running? Try --port.` : err.message);
       resolveExit(1);
     });
     server.listen(cfg.port, '127.0.0.1', () => {
@@ -187,13 +210,95 @@ export function envText(client: string, port: number, shell: Shell, current: Nod
   return out.join('\n').trimEnd();
 }
 
+/** Which wire format a request body is, from its shape (for `scan --body` without `--api`). */
+export function guessApi(body: unknown): Api {
+  if (typeof body !== 'object' || body === null) return 'other';
+  const b = body as Record<string, unknown>;
+  if (Array.isArray(b.input) || typeof b.input === 'string') return 'responses';
+  if (!Array.isArray(b.messages)) return 'other';
+  const chatty = b.messages.some((m) => typeof m === 'object' && m !== null && (['system', 'developer', 'tool'].includes(String((m as Record<string, unknown>).role)) || 'tool_calls' in m));
+  return chatty ? 'chat' : 'anthropic';
+}
+
+interface Change {
+  path: string;
+  /** Detectors whose placeholders appear in the new value (none: added by llm-redact, e.g. the note). */
+  redacted: string[];
+  added?: boolean;
+}
+
+/** Where a redacted body differs from the original: JSON paths, and what was redacted there. */
+export function bodyChanges(before: unknown, after: unknown, path = '', out: Change[] = []): Change[] {
+  const labels = (x: unknown) => [...JSON.stringify(x ?? null).matchAll(/\[\[REDACTED:([a-z0-9_]+):[0-9a-f]{8}\]\]/g)].map((m) => m[1] as string);
+  if (Array.isArray(before) && Array.isArray(after)) {
+    for (let i = 0; i < Math.max(before.length, after.length); i++) {
+      if (i >= before.length) out.push({ path: `${path}[${i}]`, redacted: [], added: true });
+      else bodyChanges(before[i], after[i], `${path}[${i}]`, out);
+    }
+    return out;
+  }
+  if (typeof before === 'object' && before !== null && typeof after === 'object' && after !== null && !Array.isArray(before) && !Array.isArray(after)) {
+    const ka = Object.keys(before);
+    const kb = Object.keys(after);
+    // Keys can be redacted too (inside tool inputs), so entries are matched by position.
+    for (let i = 0; i < Math.max(ka.length, kb.length); i++) {
+      const k = (kb[i] ?? ka[i]) as string;
+      const p = path ? `${path}.${/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)}` : k;
+      if (i >= ka.length) out.push({ path: p, redacted: [], added: true });
+      else {
+        if (ka[i] !== kb[i]) out.push({ path: p, redacted: labels(kb[i]) });
+        bodyChanges((before as Record<string, unknown>)[ka[i] as string], (after as Record<string, unknown>)[kb[i] as string], p, out);
+      }
+    }
+    return out;
+  }
+  if (JSON.stringify(before) !== JSON.stringify(after)) {
+    // Placeholders that were not there before (a request can carry the model's earlier ones).
+    const fresh = labels(after);
+    for (const l of labels(before)) {
+      const i = fresh.indexOf(l);
+      if (i >= 0) fresh.splice(i, 1);
+    }
+    // Nothing new redacted: the value only grew (the note appended to the system prompt).
+    out.push(fresh.length ? { path, redacted: fresh } : { path, redacted: [], added: true });
+  }
+  return out;
+}
+
+function cmdScanBody(v: Values, text: string, cfg: Config): number {
+  let body: unknown;
+  try {
+    body = parseJson(text);
+  } catch (err) {
+    console.error(`Not a JSON request body: ${(err as Error).message}`);
+    return 1;
+  }
+  const api = (v.api as Api | undefined) ?? guessApi(body);
+  if (!['anthropic', 'chat', 'responses', 'other'].includes(api)) throw new UsageError(`--api must be anthropic, chat, responses or other`);
+  const r = redactRequest(body, new Vault(loadKey()), api, cfg.redact);
+  const changes = bodyChanges(body, r.body);
+  if (v.json) {
+    process.stdout.write(JSON.stringify({ api, summary: summarize(r.hits), changes }, null, 2) + '\n');
+    return 0;
+  }
+  console.log(`As ${api === 'chat' ? 'OpenAI Chat Completions' : api === 'responses' ? 'OpenAI Responses' : api === 'anthropic' ? 'Anthropic Messages' : 'a generic JSON'} request${v.api ? '' : ' (guessed from its shape; set --api to choose)'}:`);
+  if (!changes.length) console.log('  nothing would change.');
+  const width = Math.min(60, Math.max(0, ...changes.map((c) => c.path.length)));
+  for (const c of changes) console.log(`  ${c.path.padEnd(width)}  ${c.added && !c.redacted.length ? '(added: the note telling the model what placeholders are)' : [...new Set(c.redacted)].map((d) => `${d} x${c.redacted.filter((x) => x === d).length}`).join(' ')}`);
+  const s = summarize(r.hits);
+  console.log(r.hits.length ? `${r.hits.length} value(s) in ${changes.filter((c) => c.redacted.length).length} field(s): ${Object.entries(s).map(([k, n]) => `${k} x${n}`).join(' ')}` : 'No values to redact.');
+  return 0;
+}
+
 function cmdScan(v: Values, file: string | undefined): number {
   const cfg = loadConfig(v);
   const raw = !file || file === '-' ? readFileSync(0, 'utf8') : readFileSync(file, 'utf8');
   const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw; // a BOM from PowerShell pipes
+  if (v.body) return cmdScanBody(v, text, cfg);
   const r = redactText(text, new Vault(loadKey()), cfg.redact);
   if (v.json) {
-    const lineOf = (i: number) => text.slice(0, i).split('\n').length;
+    // Values found in an encoded form (JSON escapes, %40 …) have no position of their own.
+    const lineOf = (i: number) => (i < 0 ? null : text.slice(0, i).split('\n').length);
     process.stdout.write(JSON.stringify({ summary: summarize(r.hits), hits: r.hits.map((h) => ({ detector: h.detector, kind: h.kind, line: lineOf(h.start), placeholder: h.placeholder })) }, null, 2) + '\n');
   } else {
     process.stdout.write(r.text);
@@ -266,12 +371,18 @@ export async function main(argv: string[]): Promise<number> {
       case 'stats':
         return await cmdStats(v);
       default:
-        throw new UsageError(`unknown command "${cmd}"`);
+        throw new UsageError(`unknown command "${cmd}"${didYouMean(cmd, COMMANDS)} (commands: ${COMMANDS.join(', ')}; see llm-redact --help)`);
     }
   } catch (err) {
     if (err instanceof UsageError) {
       console.error(err.message);
       return 2;
+    }
+    // A file that cannot be read is the user's to fix, not a crash: one line, no stack.
+    const e = err as NodeJS.ErrnoException;
+    if (e?.syscall && ['ENOENT', 'EACCES', 'EISDIR', 'EPERM'].includes(e.code ?? '')) {
+      console.error(`cannot read ${e.path ?? rest[0] ?? 'the input'}: ${e.code === 'ENOENT' ? 'no such file' : e.code === 'EISDIR' ? 'it is a directory' : 'permission denied'}`);
+      return 1;
     }
     console.error((err as Error)?.stack ?? String(err));
     return 1;

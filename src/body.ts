@@ -57,9 +57,12 @@ const MIN_NUMBER_DIGITS = 7;
  * A signed block: a thinking block with its signature, redacted thinking, encrypted reasoning
  * (OpenAI, OpenRouter's `reasoning.*` details). A block merely *called* thinking is not one.
  */
-function isSigned(o: Record<string, unknown>): boolean {
+export function isSigned(o: Record<string, unknown>): boolean {
   const t = o.type;
-  if (typeof t !== 'string' || !(SIGNED_TYPES.has(t) || t.startsWith('reasoning.'))) return false;
+  if (typeof t !== 'string') return false;
+  // OpenRouter's reasoning details must go back exactly as they came, signed or not.
+  if (t.startsWith('reasoning.')) return true;
+  if (!SIGNED_TYPES.has(t)) return false;
   return typeof o.signature === 'string' || typeof o.encrypted_content === 'string' || typeof o.data === 'string' || (t === 'reasoning' && typeof o.id === 'string');
 }
 
@@ -156,7 +159,7 @@ function envelopeKey(parent: Record<string, unknown>, k: string): string {
   return k === 'name' && typeof parent.role === 'string' ? '' : k;
 }
 
-function walk(v: unknown, fn: Visit, key = '', mode: Mode = 'envelope', depth = 0): unknown {
+function walk(v: unknown, fn: Visit, key = '', mode: Mode = 'envelope', depth = 0, signed: (o: Record<string, unknown>) => boolean = isSigned): unknown {
   if (depth > MAX_DEPTH) throw new Error(`request nested deeper than ${MAX_DEPTH} levels`);
   if (typeof v === 'string') {
     if (isBinary(key, v)) return v.startsWith('data:') ? dataUrlText(v, fn) : v;
@@ -169,9 +172,9 @@ function walk(v: unknown, fn: Visit, key = '', mode: Mode = 'envelope', depth = 
     const r = fn(digits, key, mode !== 'envelope');
     return r === digits ? v : r;
   }
-  if (Array.isArray(v)) return v.map((x) => walk(x, fn, key, mode, depth + 1));
+  if (Array.isArray(v)) return v.map((x) => walk(x, fn, key, mode, depth + 1, signed));
   if (!isObject(v) || isRaw(v)) return v;
-  if (mode !== 'data' && isSigned(v)) return v;
+  if (mode !== 'data' && signed(v)) return v;
   const out: Record<string, unknown> = {};
   for (const [k, x] of Object.entries(v)) {
     if (mode === 'envelope' && depth === 0 && OPAQUE_TOP.has(k)) {
@@ -185,7 +188,7 @@ function walk(v: unknown, fn: Visit, key = '', mode: Mode = 'envelope', depth = 
     }
     // Outside a known envelope object keys are data too (`{"li.wei@corp-mail.cn": "admin"}`).
     const name = mode === 'envelope' ? k : fn(k, '', true);
-    put(out, name, walk(x, fn, envelopeKey(v, k), mode === 'envelope' && isDataField(v, k, x) ? 'data' : mode, depth + 1));
+    put(out, name, walk(x, fn, envelopeKey(v, k), mode === 'envelope' && isDataField(v, k, x) ? 'data' : mode, depth + 1, signed));
   }
   return out;
 }
@@ -296,7 +299,18 @@ export function redactForm(body: string, vault: Vault, opts: RedactOptions = {})
 export const jsonEncode = (value: string): string => JSON.stringify(value).slice(1, -1);
 
 /** Restore placeholders in a parsed (non-streamed) response body — tool inputs, keys and arguments included. */
-export function restoreResponse(body: unknown, vault: Vault): unknown {
-  // Everywhere except signed blocks (sent back verbatim next turn: a restored value would go out in clear).
-  return walk(body, (s, key) => vault.restore(s, JSON_TEXT.has(key) ? jsonEncode : undefined), '', 'loose');
+/**
+ * Never restored: thinking and reasoning, signed or not. Signed ones go back verbatim next turn (a
+ * restored value would go out in clear); unsigned ones arrive as stream deltas that are not restored
+ * either, and a response must read the same streamed or not.
+ */
+const isReasoning = (o: Record<string, unknown>): boolean => isSigned(o) || (typeof o.type === 'string' && SIGNED_TYPES.has(o.type));
+
+/**
+ * Restore placeholders in a parsed (non-streamed) response body — tool inputs, keys and arguments
+ * included. In a known API, `arguments` / `partial_json` of the envelope are JSON text and get
+ * JSON-escaped values; a tool's own parameter that happens to be called `arguments` does not.
+ */
+export function restoreResponse(body: unknown, vault: Vault, api: Api = 'other'): unknown {
+  return walk(body, (s, key, free) => vault.restore(s, JSON_TEXT.has(key) && !free ? jsonEncode : undefined), '', api === 'other' ? 'loose' : 'envelope', 0, isReasoning);
 }

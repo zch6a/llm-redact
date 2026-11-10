@@ -35,6 +35,15 @@ export interface Hit {
   placeholder: string;
 }
 
+/** A redaction result, with the (label, value) behind each hit, in order. */
+interface Cached {
+  text: string;
+  hits: Hit[];
+  values: [string, string][];
+  /** Where the vault's known-value log stood when this was computed. */
+  mark: { epoch: number; at: number };
+}
+
 /** More matches in one text than any real request has: refuse it rather than redact part of it. */
 export class RedactLimitError extends Error {
   readonly status = 413;
@@ -46,7 +55,7 @@ export class RedactLimitError extends Error {
  * by size. In memory only — like the vault, it holds real values.
  */
 export class RedactCache {
-  private readonly map = new Map<string, { text: string; hits: Hit[] }>();
+  private readonly map = new Map<string, Cached>();
   private size = 0;
   readonly maxChars: number;
   /** Texts shorter than this are cheaper to redact than to look up. */
@@ -56,7 +65,7 @@ export class RedactCache {
     this.maxChars = maxChars;
   }
 
-  get(text: string): { text: string; hits: Hit[] } | undefined {
+  get(text: string): Cached | undefined {
     const r = this.map.get(text);
     if (r) {
       this.map.delete(text);
@@ -65,7 +74,7 @@ export class RedactCache {
     return r;
   }
 
-  set(text: string, r: { text: string; hits: Hit[] }): void {
+  set(text: string, r: Cached): void {
     const cost = text.length + r.text.length;
     if (cost > this.maxChars / 4 || this.map.has(text)) return;
     this.map.set(text, r);
@@ -284,10 +293,29 @@ export function redactText(text: string, vault: Vault, opts: RedactOptions = {})
   if (!text) return { text, hits: [] };
   const cache = opts.cache && text.length >= RedactCache.MIN ? opts.cache : undefined;
   const cached = cache?.get(text);
-  if (cached) return { text: cached.text, hits: cached.hits.map((h) => ({ ...h })) };
-  const r = redactUncached(text, vault, opts);
-  cache?.set(text, { text: r.text, hits: r.hits.map((h) => ({ ...h })) });
-  return r;
+  if (cached && cacheValid(cached, text, vault)) return { text: cached.text, hits: cached.hits.map((h) => ({ ...h })) };
+  let mark = vault.knownMark;
+  let r = redactUncached(text, vault, opts);
+  // This text taught the vault a value (`DB_PASSWORD=x` … `psql -W x`): once more, so the value is
+  // also found where only the known-value pass can see it. (A second round learns nothing new.)
+  if (vault.knownSince(mark)?.length !== 0) {
+    mark = vault.knownMark;
+    r = redactUncached(text, vault, opts);
+  }
+  cache?.set(text, { text: r.text, hits: r.hits.map((h) => ({ ...h })), values: r.values, mark });
+  return { text: r.text, hits: r.hits };
+}
+
+/**
+ * A cached result is still right when its values get the same placeholders (putting them back into
+ * a vault that may have forgotten them) and no value learned since then occurs in the text.
+ */
+function cacheValid(cached: Cached, text: string, vault: Vault): boolean {
+  if (!cached.values.every(([label, value], i) => vault.placeholderFor(label, value) === cached.hits[i]?.placeholder)) return false;
+  const learned = vault.knownSince(cached.mark);
+  if (!learned || learned.some((v) => text.includes(v))) return false;
+  cached.mark = vault.knownMark;
+  return true;
 }
 
 interface Replacement extends Span {
@@ -296,8 +324,16 @@ interface Replacement extends Span {
   direct: boolean;
 }
 
-function redactUncached(text: string, vault: Vault, opts: RedactOptions): { text: string; hits: Hit[] } {
-  const detectors = activeDetectors(opts);
+/** Values the vault learned from their context, as a detector that runs first. */
+function knownDetector(vault: Vault): Detector | undefined {
+  const re = vault.knownPattern();
+  return re && { id: KNOWN, kind: 'secret', description: 'A value already redacted by its context, wherever it appears again', re };
+}
+const KNOWN = 'known_value';
+
+function redactUncached(text: string, vault: Vault, opts: RedactOptions): Omit<Cached, 'mark'> {
+  const known = knownDetector(vault);
+  const detectors = known ? [known, ...activeDetectors(opts)] : activeDetectors(opts);
   const allow = new Set(opts.allow ?? []);
   const reps: Replacement[] = findValues(text, detectors, allow).map((f) => ({ ...f, direct: true }));
   // Values visible only once the text is decoded: map their spans back to the original.
@@ -318,16 +354,20 @@ function redactUncached(text: string, vault: Vault, opts: RedactOptions): { text
     reps.sort((a, b) => a.start - b.start);
   }
   const hits: Hit[] = [];
+  const values: [string, string][] = [];
   const parts: string[] = [];
   let pos = 0;
   for (const f of reps) {
-    const placeholder = vault.placeholderFor(f.detector.id, f.value);
+    // A known value keeps the label (and so the placeholder) it was first redacted with.
+    const label = f.detector.id === KNOWN ? (vault.knownLabel(f.value) ?? 'secret_assignment') : f.detector.id;
+    const placeholder = vault.placeholderFor(label, f.value);
     parts.push(text.slice(pos, f.start), placeholder);
     pos = f.end;
-    hits.push({ detector: f.detector.id, kind: f.detector.kind, start: f.direct ? f.start : -1, end: f.direct ? f.end : -1, placeholder });
+    hits.push({ detector: label, kind: f.detector.id === KNOWN ? 'secret' : f.detector.kind, start: f.direct ? f.start : -1, end: f.direct ? f.end : -1, placeholder });
+    values.push([label, f.value]);
   }
   parts.push(text.slice(pos));
-  return { text: parts.join(''), hits };
+  return { text: parts.join(''), hits, values };
 }
 
 /** Counts per detector — what a log or report may show. Never values. */

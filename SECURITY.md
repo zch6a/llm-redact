@@ -9,6 +9,7 @@ llm-redact sees your secrets by design — that is the only way to keep them fro
 - Logs counts per detector, never request bodies, values or placeholders' values.
 - Talks to nothing but the upstreams you configured. No telemetry.
 - Has no runtime dependencies.
+- Bounded memory: at most 200,000 values (least recently used forgotten first), a 32 M-character result cache, 5,000 remembered context-found values; responses are limited to the request body limit (default 64 MB) and written with backpressure, so a runaway upstream cannot exhaust memory.
 - Fails closed: a body it cannot redact (invalid JSON, absurd nesting, a decompression bomb, an upload) is refused rather than forwarded, unless you start it with `--allow-unredacted`. Redirects that leave the upstream are refused (the client would re-send its unredacted body).
 
 ## What it does not protect against

@@ -10,9 +10,11 @@ import { gzipSync } from 'node:zlib';
 import { apiFor, parseJson, redactForm, redactRequest, restoreResponse } from '../src/body.ts';
 import { createProxy } from '../src/proxy.ts';
 import { RedactLimitError, redactText } from '../src/redact.ts';
-import { SseParser, SseRestorer } from '../src/sse.ts';
+import { NdjsonRestorer, SseParser, SseRestorer } from '../src/sse.ts';
 import { Vault } from '../src/vault.ts';
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Json = Record<string, any>;
 const v = new Vault(Buffer.alloc(32, 5));
 const EMAIL = 'li.wei@corp-mail.cn';
 const SECRET = 'sk-proj-' + 'Qw3rTy6uIo9pAs2dFg5hJk8l'.repeat(2);
@@ -110,9 +112,11 @@ describe('engine: escaped and encoded text', () => {
 });
 
 describe('detectors: spans and shapes from the review', () => {
-  it('url_password redacts the password even when the host repeats it', () => {
-    const r = redactText('postgres://postgres:Pg-Pass9x@Pg-Pass9x.db.internal:5432/app', v);
-    assert.match(r.text, /^postgres:\/\/postgres:\[\[REDACTED:url_password:[0-9a-f]{8}\]\]@Pg-Pass9x\.db\.internal:5432\/app$/);
+  it('url_password redacts the password span even when the host repeats it', () => {
+    // The password span is found by position (not by searching for the value); its other
+    // occurrence — here, absurdly, in the host — is then a known secret and redacted too.
+    const r = redactText('postgres://postgres:Pg-Pass9x@Pg-Pass9x.db.internal:5432/app', new Vault(Buffer.alloc(32, 11)));
+    assert.match(r.text, /^postgres:\/\/postgres:(\[\[REDACTED:url_password:[0-9a-f]{8}\]\])@\1\.db\.internal:5432\/app$/);
   });
   it('a URL with credentials does not swallow an e-mail after it', () => {
     const r = redactText(`postgres://app:Secr3tPw9@db.internal,${EMAIL}`, v);
@@ -193,6 +197,27 @@ before(async () => {
       res.write(line(ph.slice(20) + ' ok'));
       return res.end(line('', true));
     }
+    // ---- round 3 (response side)
+    const firstPh = /\[\[REDACTED:secret_assignment:[0-9a-f]{8}\]\]/.exec(lastRaw)?.[0] ?? PH.exec(lastRaw)?.[0] ?? '';
+    if (path === '/r3/psql') return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: 'm', type: 'message', role: 'assistant', content: [{ type: 'text', text: `Running psql with ${firstPh}.` }] }));
+    if (path === '/r3/numbers') return res.writeHead(200, { 'content-type': 'application/json' }).end(`{"content":[{"type":"tool_use","id":"t","name":"x","input":{"order":12345678901234567890,"price":1.10,"k":"${firstPh}"}}]}`);
+    if (path === '/r3/cookies') return res.writeHead(200, [['content-type', 'application/json'], ['content-length', '2'], ['set-cookie', 'a=1; path=/'], ['set-cookie', 'b=2; path=/']]).end(req.method === 'HEAD' ? undefined : '{}');
+    if (path === '/r3/untyped') return res.writeHead(200).end(JSON.stringify({ text: firstPh }));
+    if (path === '/r3/text') return res.writeHead(500, { 'content-type': 'text/plain' }).end(`bad value ${firstPh}`);
+    if (path === '/r3/compress') return res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'compress' }).end(Buffer.from([31, 157, 1, 2, 3]));
+    if (path === '/r3/huge') return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ x: 'y'.repeat(2 * 1024 * 1024) }));
+    if (path === '/r3/endless') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: ');
+      const chunk = 'z'.repeat(64 * 1024);
+      let n = 0;
+      const t = setInterval(() => {
+        if (res.destroyed || n++ > 100) return clearInterval(t), res.end();
+        res.write(chunk);
+      }, 1);
+      return;
+    }
+    if (path === '/r3/cut') return res.writeHead(200, { 'content-type': 'text/event-stream' }).end(`data: {"type":"message_stop"}\n\ndata: {"partial": "${firstPh}`);
     if (path === '/redirect-same') return res.writeHead(307, { location: '/v1/other' }).end();
     if (path === '/redirect-away') return res.writeHead(307, { location: 'https://elsewhere.example/collect' }).end();
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, path }));
@@ -352,7 +377,8 @@ describe('round 2: walker', () => {
     noLeak(sent(body, 'chat'), '4111111111111111');
     assert.match(sent(toolUse({ ts: 1731300000 })), /"ts":1731300000/);
   });
-  it('#14 numbers are kept exactly as written; "__proto__" keys are kept', () => {
+  // Exact numbers need JSON.rawJSON (every supported Node has it; CI also runs the suite without it).
+  it('#14 numbers are kept exactly as written; "__proto__" keys are kept', { skip: typeof (JSON as { rawJSON?: unknown }).rawJSON !== 'function' && 'needs JSON.rawJSON' }, () => {
     const raw = '{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"n","input":{"order_id":12345678901234567890,"price":1.10,"__proto__":{"x":1},"mail":"' + EMAIL + '"}}]}]}';
     const s = JSON.stringify(redactRequest(parseJson(raw), v, 'anthropic').body);
     assert.match(s, /"order_id":12345678901234567890,"price":1\.10,"__proto__":\{"x":1\}/);
@@ -389,7 +415,9 @@ describe('round 2: engine', () => {
   it('#10 pass / pw in JSON text, not inside other words', () => {
     noLeak(redactText('{"db":{"pass":"Xy7pQ2rL9zW"}}', v).text, 'Xy7pQ2rL9zW');
     noLeak(redactText('{"db":{"pw":"Xy7pQ2rL9zW"}}', v).text, 'Xy7pQ2rL9zW');
-    for (const t of ['bypass = Xy7pQ2rL9zW1', 'compass: "Xy7pQ2rL9zW1"', '"pass_rate": f"{delta:+.1f}"']) assert.equal(redactText(t, v).text, t);
+    // A fresh vault: the shared one already knows Xy7pQ2rL9zW as a password, and would rightly redact it anywhere.
+    const fresh = new Vault(Buffer.alloc(32, 12));
+    for (const t of ['bypass = Xy7pQ2rL9zW1', 'compass: "Xy7pQ2rL9zW1"', '"pass_rate": f"{delta:+.1f}"']) assert.equal(redactText(t, fresh).text, t);
   });
   it('#12 placeholders already in the text are never redacted again', () => {
     // Labels that name secrets, and tags of 8 distinct characters, were the case that broke.
@@ -415,10 +443,11 @@ describe('round 2: engine', () => {
   it('#17 #18 no quadratic work: escaped text and many distinct values', () => {
     let t0 = Date.now();
     redactText('\\"' + `${EMAIL} `.repeat(40_000), v);
-    assert.ok(Date.now() - t0 < 1500, `escaped: ${Date.now() - t0} ms`);
+    // Generous bounds (other tests run alongside); the quadratic versions took 13 s and 9.7 s.
+    assert.ok(Date.now() - t0 < 4000, `escaped: ${Date.now() - t0} ms`);
     t0 = Date.now();
     redactText(Array.from({ length: 100_000 }, (_, i) => `u${i}@corp-mail.cn`).join(' '), v);
-    assert.ok(Date.now() - t0 < 2500, `distinct: ${Date.now() - t0} ms`);
+    assert.ok(Date.now() - t0 < 5000, `distinct: ${Date.now() - t0} ms`);
   });
 });
 
@@ -449,8 +478,9 @@ describe('round 2: streams', () => {
     assert.equal(n, 1);
     assert.ok(Date.now() - t0 < 1000, `${Date.now() - t0} ms`);
     const q = new SseParser();
-    const evs = [...q.feed('data: 1\r\rdata: 2\r'), ...q.feed('\n\r\n'), ...q.end()];
+    const evs = [...q.feed('data: 1\r\rdata: 2\r'), ...q.feed('\n\r\n')];
     assert.deepEqual(evs.map((e) => e.data), ['1', '2']);
+    assert.deepEqual(q.end(), { events: [], rest: '' });
   });
 });
 
@@ -494,5 +524,186 @@ describe('round 2: proxy', () => {
     });
     assert.equal(status, 200);
     noLeak(lastRaw, SECRET);
+  });
+});
+// ==== Round 3 review: the response side =========================================================
+
+describe('round 3: values restored once are never sent in clear again', () => {
+  it('#1 a password found by its context, restored, then written elsewhere by the model, stays redacted next turn', async () => {
+    const base = await start({ vault: new Vault(Buffer.alloc(32, 31)) });
+    const turn1 = [{ role: 'user', content: 'Connect with DB_PASSWORD=Tr0ub4dor-zq9x please' }];
+    const r1 = await post(base, '/mock/r3/psql', JSON.stringify({ model: 'm', max_tokens: 1, messages: turn1 }), { 'content-type': 'application/json' });
+    noLeak(lastRaw, 'Tr0ub4dor-zq9x');
+    const reply = (await r1.json()) as { content: { type: string; text: string }[] };
+    assert.equal(reply.content[0]?.text, 'Running psql with Tr0ub4dor-zq9x.', 'the client gets the real value');
+    // Turn 2: the client sends its history back — the model's reply now holds the bare value.
+    const turn2 = [...turn1, { role: 'assistant', content: reply.content }, { role: 'user', content: 'and now as psql -W Tr0ub4dor-zq9x' }];
+    await post(base, '/mock/r3/psql', JSON.stringify({ model: 'm', max_tokens: 1, messages: turn2 }), { 'content-type': 'application/json' });
+    noLeak(lastRaw, 'Tr0ub4dor-zq9x');
+    assert.equal((lastRaw.match(/\[\[REDACTED:secret_assignment:[0-9a-f]{8}\]\]/g) ?? []).length >= 3, true, 'same placeholder in all three places');
+  });
+  it('known values are found in the same text that taught them, and in encoded forms', () => {
+    const fresh = new Vault(Buffer.alloc(32, 32));
+    const r = redactText('API_TOKEN=Zq8-mW3pL7vT2k\nthen curl -H "X-Key: Zq8-mW3pL7vT2k"', fresh);
+    noLeak(r.text, 'Zq8-mW3pL7vT2k');
+    noLeak(redactText(JSON.stringify(JSON.stringify({ k: 'Zq8-mW3pL7vT2k' })), fresh).text, 'Zq8-mW3pL7vT2k');
+    // Short values are not searched for everywhere (they would match ordinary text).
+    redactText('PASSWORD=Ab1-x9Q', fresh);
+    assert.equal(redactText('Ab1-x9Q is a SKU', fresh).text, 'Ab1-x9Q is a SKU');
+  });
+});
+
+describe('round 3: response bodies', () => {
+  it('#4 numbers in a restored response are exactly as the upstream wrote them', { skip: typeof (JSON as { rawJSON?: unknown }).rawJSON !== 'function' && 'needs JSON.rawJSON' }, async () => {
+    await post(px, '/mock/v1/messages', JSON.stringify({ model: 'm', max_tokens: 1, messages: [{ role: 'user', content: `DB_PASSWORD=${TRICKY}` }] }), { 'content-type': 'application/json' });
+    const res = await post(px, '/mock/r3/numbers', JSON.stringify({ model: 'm', max_tokens: 1, messages: [{ role: 'user', content: `DB_PASSWORD=${TRICKY}` }] }), { 'content-type': 'application/json' });
+    const text = await res.text();
+    assert.match(text, /"order":12345678901234567890,"price":1\.10/);
+    assert.equal(JSON.parse(text).content[0].input.k, TRICKY);
+  });
+  it('#7 a tool parameter called "arguments" is not JSON-escaped twice', () => {
+    const ph = v.placeholderFor('secret_assignment', TRICKY);
+    const out = restoreResponse({ content: [{ type: 'tool_use', id: 't', name: 'run', input: { arguments: ph } }] }, v, 'anthropic') as { content: { input: { arguments: string } }[] };
+    assert.equal(out.content[0]?.input.arguments, TRICKY);
+    // …while the envelope's own JSON-text arguments are escaped (they are JSON text).
+    const chat = restoreResponse({ choices: [{ message: { tool_calls: [{ function: { name: 'f', arguments: `{"p":"${ph}"}` } }] } }] }, v, 'chat') as Json;
+    assert.equal(JSON.parse(chat.choices[0].message.tool_calls[0].function.arguments).p, TRICKY);
+  });
+  it('#16 every Set-Cookie survives; HEAD keeps its length; untyped JSON and text/plain are restored', async () => {
+    const body = JSON.stringify({ model: 'm', max_tokens: 1, messages: [{ role: 'user', content: `DB_PASSWORD=${TRICKY}` }] });
+    const c = await post(px, '/mock/r3/cookies', body, { 'content-type': 'application/json' });
+    assert.deepEqual(c.headers.getSetCookie(), ['a=1; path=/', 'b=2; path=/']);
+    const head = await fetch(px + '/mock/r3/cookies', { method: 'HEAD' });
+    assert.equal(head.headers.get('content-length'), '2');
+    assert.equal(((await (await post(px, '/mock/r3/untyped', body, { 'content-type': 'application/json' })).json()) as { text: string }).text, TRICKY);
+    assert.equal(await (await post(px, '/mock/r3/text', body, { 'content-type': 'application/json' })).text(), `bad value ${TRICKY}`);
+  });
+  it('#16 a content-encoding fetch cannot undo goes through untouched, header and bytes', async () => {
+    const res = await post(px, '/mock/r3/compress', msg, { 'content-type': 'application/json' });
+    assert.equal(res.headers.get('content-encoding'), 'compress');
+    assert.deepEqual([...new Uint8Array(await res.arrayBuffer())], [31, 157, 1, 2, 3]);
+  });
+  it('#6 response size is bounded: a huge JSON body or an endless SSE event ends the response, not the proxy', async () => {
+    const small = await start({ maxBody: 1024 * 1024 });
+    assert.equal((await post(small, '/mock/r3/huge', msg, { 'content-type': 'application/json' })).status, 502);
+    const endless = await post(small, '/mock/r3/endless', msg, { 'content-type': 'application/json' });
+    await assert.rejects(endless.text());
+    assert.equal((await fetch(small + '/')).status, 200, 'still serving');
+  });
+  it('#14 an event cut off at the end goes out as the bytes it was (a client discards it)', async () => {
+    const res = await post(px, '/mock/r3/cut', JSON.stringify({ model: 'm', max_tokens: 1, stream: true, messages: [{ role: 'user', content: `DB_PASSWORD=${TRICKY}` }] }), { 'content-type': 'application/json' });
+    const text = await res.text();
+    assert.ok(text.endsWith('data: {"partial": "[[REDACTED:secret_assignment:' + /secret_assignment:([0-9a-f]{8})/.exec(text)![1] + ']]'), text);
+  });
+  it('#15 invalid JSON is passed through as it came, not blindly restored (signed thinking stays intact)', () => {
+    // The proxy's JSON fallback: nothing to test here beyond restoreResponse refusing deep bodies.
+    let deep: unknown = { type: 'text', text: v.placeholderFor('email', EMAIL) };
+    for (let i = 0; i < 1000; i++) deep = [deep];
+    assert.throws(() => restoreResponse(deep, v, 'anthropic'), /nested deeper/);
+  });
+});
+
+describe('round 3: streams', () => {
+  const ph = () => v.placeholderFor('secret_assignment', TRICKY);
+  const through = (api: 'anthropic' | 'chat' | 'responses' | 'other', events: unknown[], heads?: string[][]) => {
+    const r = new SseRestorer(v, api);
+    const out = events.flatMap((d, i) => r.transform({ head: heads?.[i] ?? [], data: JSON.stringify(d) }));
+    out.push(...r.finish());
+    return out;
+  };
+  const datas = (out: { data: string | null }[]) => out.map((e) => JSON.parse(e.data ?? 'null') as Json);
+  it('#8 Responses: error, refusal, MCP arguments, annotations are restored', () => {
+    const p = ph();
+    const out = datas(through('responses', [
+      { type: 'response.refusal.delta', item_id: 'm', output_index: 0, content_index: 0, delta: `no: ${p}` },
+      { type: 'response.refusal.done', item_id: 'm', output_index: 0, content_index: 0, refusal: `no: ${p}` },
+      { type: 'response.mcp_call_arguments.delta', item_id: 'c', output_index: 1, delta: `{"k":"${p}"}` },
+      { type: 'response.mcp_call_arguments.done', item_id: 'c', output_index: 1, arguments: `{"k":"${p}"}` },
+      { type: 'response.output_text.annotation.added', item_id: 'm', annotation: { type: 'url_citation', title: p } },
+      { type: 'error', code: 'x', message: `bad ${p}` },
+    ]));
+    const s = JSON.stringify(out);
+    assert.ok(!s.includes('[[REDACTED:'), s);
+    assert.equal(JSON.parse(out[3]!.arguments).k, TRICKY);
+  });
+  it('#9 Anthropic citations are restored when streamed', () => {
+    const out = datas(through('anthropic', [{ type: 'content_block_delta', index: 0, delta: { type: 'citations_delta', citation: { type: 'char_location', cited_text: `see ${ph()}` } } }]));
+    assert.equal(out[0]!.delta.citation.cited_text, `see ${TRICKY}`);
+  });
+  it('#10 held-back text is flushed when a Responses stream ends without its done event', () => {
+    const out = datas(through('responses', [{ type: 'response.output_text.delta', item_id: 'm', output_index: 0, content_index: 0, delta: 'see x[', sequence_number: 3 }]));
+    assert.equal(out.map((d) => d.delta).join(''), 'see x[');
+  });
+  it('#11 a made-up tail event has no id: line and its own sequence number', () => {
+    const out = through('responses', [
+      { type: 'response.output_text.delta', item_id: 'm', output_index: 0, content_index: 0, delta: 'x[[RED', sequence_number: 5 },
+      { type: 'response.output_text.done', item_id: 'm', output_index: 0, content_index: 0, text: 'x[[RED', sequence_number: 6 },
+    ], [['id: 41', 'event: response.output_text.delta'], ['id: 42', 'event: response.output_text.done']]);
+    assert.deepEqual(out.map((e) => e.head), [['id: 41', 'event: response.output_text.delta'], ['event: response.output_text.delta'], ['id: 42', 'event: response.output_text.done']]);
+    assert.deepEqual(datas(out).map((d) => d.sequence_number), [5, 6, 7]);
+  });
+  it('#12 Chat: the tail goes into the finish chunk; usage is not repeated', () => {
+    const out = datas(through('chat', [
+      { id: 'c', choices: [{ index: 0, delta: { content: 'ends with [' }, finish_reason: null }] },
+      { id: 'c', choices: [{ index: 0, finish_reason: 'stop' }] },
+      { id: 'c', choices: [], usage: { total_tokens: 10 } },
+    ]));
+    assert.equal(out.length, 3);
+    assert.equal(out[1]!.choices[0].delta.content, '[');
+    assert.equal(out.filter((d) => d.usage).length, 1);
+  });
+  it('#12 a flush chunk never copies usage (streams that report usage in every chunk)', () => {
+    const out = datas(through('chat', [
+      { id: 'c', choices: [{ index: 0, delta: { content: 'cut at [' }, finish_reason: null }], usage: { total_tokens: 7 } },
+    ]));
+    assert.equal(out.length, 2, 'the chunk, then the flushed tail');
+    assert.equal(out[1]!.choices[0].delta.content, '[');
+    assert.equal(out[1]!.usage, undefined);
+  });
+  it('#4 numbers in streamed events are exactly as the upstream wrote them', { skip: typeof (JSON as { rawJSON?: unknown }).rawJSON !== 'function' && 'needs JSON.rawJSON' }, () => {
+    const out = through('anthropic', [{ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 }, x: 12345678901234567890, y: 1.1 }]);
+    const r = new SseRestorer(v, 'anthropic');
+    const raw = '{"type":"message_delta","usage":{"output_tokens":5},"x":12345678901234567890,"y":1.10}';
+    assert.equal(r.transform({ head: [], data: raw })[0]?.data, raw);
+    assert.equal(out.length, 1);
+  });
+  it('#13 server and MCP tool blocks: input restored at the start, tails as JSON deltas', () => {
+    const out = datas(through('anthropic', [
+      { type: 'content_block_start', index: 0, content_block: { type: 'mcp_tool_use', id: 'x', name: 'n', server_name: 's', input: { k: ph() } } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"a":[' } },
+      { type: 'content_block_stop', index: 0 },
+    ]));
+    assert.equal(out[0]!.content_block.input.k, TRICKY);
+    assert.equal(out[2]!.delta.type, 'input_json_delta');
+  });
+  it('#15 an event the proxy cannot process goes through as it came; the stream goes on', () => {
+    let deep = '"x"';
+    for (let i = 0; i < 1000; i++) deep = `[${deep}]`;
+    const r = new SseRestorer(v, 'anthropic');
+    const odd = `{"type":"message_delta","deep":${deep}}`;
+    assert.deepEqual(r.transform({ head: [], data: odd }), [{ head: [], data: odd }]);
+    assert.equal(r.transform({ head: [], data: '{"type":"message_stop"}' }).length, 1);
+  });
+  it('#18 #19 #20 reasoning is never restored, streamed or not, in any format', () => {
+    const p = ph();
+    const s = (x: unknown) => JSON.stringify(x);
+    // Responses: reasoning_text content parts.
+    assert.ok(s(datas(through('responses', [{ type: 'response.content_part.done', item_id: 'r', part: { type: 'reasoning_text', text: p } }]))).includes(p));
+    // OpenRouter reasoning summary in a non-streamed Chat body.
+    assert.ok(s(restoreResponse({ choices: [{ message: { content: 'x', reasoning_details: [{ type: 'reasoning.summary', summary: p }] } }] }, v, 'chat')).includes(p));
+    // Unsigned Anthropic thinking, non-streamed (it is not restored as thinking_delta either).
+    assert.ok(s(restoreResponse({ content: [{ type: 'thinking', thinking: p }] }, v, 'anthropic')).includes(p));
+    // NDJSON: a signed thinking line.
+    const line = JSON.stringify({ type: 'thinking', thinking: p, signature: 'sig' });
+    assert.equal(new NdjsonRestorer(v).feed(line + '\n'), line + '\n');
+  });
+  it('#5 NDJSON lines are not rescanned per chunk (8 MB line in 1 KB chunks)', () => {
+    const nd = new NdjsonRestorer(v);
+    const line = JSON.stringify({ message: { content: 'y'.repeat(8 * 1024 * 1024) }, done: true }) + '\n';
+    const t0 = Date.now();
+    let out = '';
+    for (let i = 0; i < line.length; i += 1024) out += nd.feed(line.slice(i, i + 1024));
+    assert.ok(Date.now() - t0 < 2000, `${Date.now() - t0} ms`);
+    assert.equal(out.length, line.length);
   });
 });

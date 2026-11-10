@@ -69,10 +69,32 @@ Done then: `src/detectors.ts`, `src/vault.ts`, `src/redact.ts`, `src/stream.ts`;
 
 167 tests (was 135).
 
-## Round 3 — backlog
+## Round 3 — done (v0.4.0)
 
-- A third review, this time of the response side only (restore paths: SSE per API, NDJSON, JSON fallback) with a fuzzer: random placeholder splits × random event shapes.
-- `scan --diff` for request bodies (show exactly which spans would change).
-- Codex with a ChatGPT login (`requires_openai_auth`, upstream `chatgpt.com/backend-api/codex`) — cannot be checked without a real login, so not claimed yet.
-- Node 22.15 check (JSON.parse with source / rawJSON are feature-detected; verify the fallback path in CI).
-- Memory: the vault grows without bound in a long-running proxy; consider an LRU with the cache's bound (values come back with the next request anyway).
+- [x] **Vault memory is bounded** (200,000 values, least recently used out first; every lookup refreshes). Forgetting is safe because each request carries the conversation's values again and the placeholder is an HMAC of the value. One trap found while doing it: the redaction cache returns a stored result *without* asking the vault, so a cached text could carry a placeholder the vault had forgotten — and the response could not be restored. Cache entries now keep their (label, value) pairs and put them back on a hit (and are discarded if a value would now get a different placeholder).
+- [x] **ECONNRESET between turns.** The suite failed once in a full run, never alone: the test before took over 5 s, Node's server closed the idle keep-alive connection exactly as the client reused it, and a POST is not retried. Agents are idle between turns all the time — this would have been a real intermittent failure. The proxy now keeps idle connections for 65 s (longer than clients do, so they close first).
+- [x] **Old-Node fallback** exercised: the suite also runs with `JSON.rawJSON` removed (a preload, `test/fixtures/no-rawjson.mjs`) — everything passes except exact-number preservation, which is skipped with a reason. CI runs that, and a new job runs the built package on Node 22.15.0 (the minimum promised).
+- [x] **`scan --body request.json`**: which fields of an API request would change and what was found in each (`--api`, `--json`), with `docs/example-request.json` to try. Also fixed: `scan --json` reported line 1 for values found in an encoded form (position −1).
+- [x] **First-run and error paths** walked through by hand: `scan` on a missing file or a directory printed a Node stack trace (now one line, exit 1); unknown commands and detectors now suggest the near miss (`scna` -> `scan`, `emial` -> `email`); the last non-ASCII characters in console output (help header, port-in-use message) replaced, as round 1 did for the rest (a non-UTF-8 Windows console garbles them). Port in use, bad port, bad `--upstream`, unknown option/client/shell were already clear.
+- [x] **Third independent review, response side only**: 20 findings, 19 reproduced, all fixed. The stream restorer itself held (the reviewer's own property test: 48,000 runs, no failure); the problems were around it:
+  - **Critical, and on the boundary of both sides: restored values went back in clear.** A value found by its *context* (`DB_PASSWORD=`) is restored where the model wrote its placeholder — `psql -W <value>` — and next turn the client's history carries the bare value where no pattern sees it. Two earlier reviews of the request side could not find this: it needs a response first. Fix: context-found values are remembered (8+ characters, 5,000 most recent, LRU) and matched first — as one alternation regex, which measured 94 ms for 5,000 values over 5 MB (a prefix map was slower) — in the text and every decoded view, keeping their placeholder; a text that teaches a value is redacted once more; cached results are checked against values learned since.
+  - Formats and events not restored: Gemini text split across events, legacy completions `choices[].text`, Responses refusals / MCP arguments / annotations / `error`, Anthropic citations, MCP and server tool blocks.
+  - Held-back text lost when the terminator never came (an error event, no `.done`); inserted tail events duplicating `id:` and `sequence_number`; a Chat flush chunk repeating `usage`.
+  - Numbers re-serialised lossily in every response (the request side had `parseJson` since 0.3.0; the response side still used `JSON.parse`).
+  - Unbounded memory: SSE events, NDJSON lines and JSON bodies with no limit, writes ignoring backpressure; NDJSON buffering quadratic (8 MB: 16 s → 18 ms).
+  - Reasoning restored on some paths and not others (Responses `reasoning_text` parts, OpenRouter `reasoning.summary`, unsigned Anthropic thinking, signed NDJSON lines) — now never, anywhere.
+  - Headers: one `Set-Cookie` of several, HEAD losing its length, an undecodable content-encoding stripped from still-encoded bytes; untyped JSON and `text/*` not restored.
+- [x] **The CR-only end-of-stream bug found while re-running the reviewer's property test**: with CR line endings the last event ends in `\r\r` at the very end of the stream; the parser rightly waits in case the CR is half a CRLF — and then handed the complete event back as raw bytes, unrestored. `end()` now returns the events that turn out complete plus the genuinely incomplete rest.
+- [x] **`test/fuzz.test.ts`**: a seeded property test of every streamed format (Anthropic text / tool JSON / cut by an error, Chat text / interleaved n=2 tool calls, legacy completions, Responses text with increasing sequence numbers / arguments, Gemini, NDJSON) × random texts (placeholders, near-placeholders, quotes, backslashes, newlines, U+2028, emoji, NUL) × random deltas × random line endings × random network chunks; every output must re-parse as SSE. 4,000 cases per run.
+- [x] **Mutation check**: 24 fixes undone one at a time; the first run showed two that no test noticed (numbers in *streamed* events; usage copied into a flush chunk, which only happens when a stream is cut before `finish_reason`). Tests added; all 24 caught.
+- [x] Smoke with the real Claude Code and Codex: still byte-identical.
+- Not claimed: Codex with a ChatGPT login (`requires_openai_auth`, upstream `chatgpt.com/backend-api/codex`) — cannot be checked without a real login.
+
+172 tests.
+
+## Round 4 — backlog
+
+- A fourth review with a different angle: the proxy as a whole under real client traffic patterns (long sessions, many turns, compaction, parallel agents on one proxy) — memory over hours, cache hit rates, vault churn.
+- `scan --body` for responses too (what would be restored, where).
+- Measure the known-value pass on a long real-shaped session (5,000 remembered values × every request).
+- Codex with a ChatGPT login (`requires_openai_auth`) — still not claimed.

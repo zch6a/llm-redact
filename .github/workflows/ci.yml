@@ -26,6 +26,30 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Tests without JSON.rawJSON (the fallback path)
+        run: node --import ./test/fixtures/no-rawjson.mjs --test "test/**/*.test.ts"
       - run: npm run build
       - name: The built CLI runs
         run: node dist/bin.js detectors && node dist/bin.js env --shell bash
+
+  # The published package is plain JavaScript and promises Node 22.15+ (the tests need 22.18+ for
+  # type stripping, so they run above). Build with a current Node, run the build on the oldest.
+  minimum-node:
+    name: Built package on Node 22.15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci && npm run build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.15.0'
+      - name: The built CLI redacts on 22.15
+        run: |
+          node --version
+          node dist/bin.js detectors
+          printf 'key sk-proj-%s mail li.wei@corp-mail.cn {"order":12345678901234567890}' Qw3rTy6uIo9pAs2dFg5hJk8lQw3rTy6uIo9pAs2dFg5hJk8l | node dist/bin.js scan - | tee out.txt
+          grep -q 'REDACTED:openai_key' out.txt && grep -q 'REDACTED:email' out.txt && ! grep -q 'li.wei@' out.txt

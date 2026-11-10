@@ -13,9 +13,10 @@
  * bodies or values.
  */
 import { timingSafeEqual } from 'node:crypto';
+import { once } from 'node:events';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from 'node:zlib';
-import { apiFor, jsonEncode, parseJson, redactForm, redactRequest, restoreResponse } from './body.ts';
+import { apiFor, parseJson, redactForm, redactRequest, restoreResponse } from './body.ts';
 import { RedactCache, redactText, summarize, type RedactOptions } from './redact.ts';
 import { NdjsonRestorer, SseParser, SseRestorer, serialize } from './sse.ts';
 import type { Vault } from './vault.ts';
@@ -65,6 +66,18 @@ async function readBody(req: IncomingMessage, max: number): Promise<Buffer> {
     size += (c as Buffer).length;
     if (size > max) throw Object.assign(new Error(`request body over ${max} bytes`), { status: 413 });
     chunks.push(c as Buffer);
+  }
+  return Buffer.concat(chunks);
+}
+
+/** A response body, up to `max` bytes (an upstream that never stops must not fill the memory). */
+async function readLimited(body: ReadableStream<Uint8Array>, max: number): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for await (const c of body) {
+    size += c.length;
+    if (size > max) throw new Error(`upstream response over ${max} bytes`);
+    chunks.push(c);
   }
   return Buffer.concat(chunks);
 }
@@ -197,10 +210,17 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
       return send(res, 502, { error: `upstream ${base} unreachable: ${(err as Error).message}` });
     }
 
-    const outHeaders: Record<string, string> = {};
+    const outHeaders: Record<string, string | string[]> = {};
     upstream.headers.forEach((v, k) => {
       if (!HOP.has(k.toLowerCase())) outHeaders[k] = v;
     });
+    // Every Set-Cookie, not only the last (Headers joins the others away).
+    const cookies = upstream.headers.getSetCookie();
+    if (cookies.length) outHeaders['set-cookie'] = cookies;
+    // fetch decodes these itself; anything else arrives still encoded and must keep its header.
+    const encoding = (upstream.headers.get('content-encoding') ?? '').toLowerCase().trim();
+    const undecoded = !!encoding && !['identity', 'gzip', 'x-gzip', 'deflate', 'br', 'zstd'].includes(encoding);
+    if (undecoded) outHeaders['content-encoding'] = encoding;
     // A redirect would make the client re-send its ORIGINAL (unredacted) body to wherever it points.
     // Within this upstream: point it back through the proxy. Anywhere else: refuse.
     if (upstream.status >= 300 && upstream.status < 400 && outHeaders.location) {
@@ -215,47 +235,74 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
       }
     }
     const type = upstream.headers.get('content-type') ?? '';
+    let outcome: string | undefined;
+    /** Write, waiting when the client reads slower than the upstream sends (no unbounded buffering). */
+    const write = async (s: string | Uint8Array): Promise<void> => {
+      if (s.length && !res.write(s)) await once(res, 'drain');
+    };
     try {
-      if (/text\/event-stream/i.test(type) && upstream.body) {
+      if (req.method === 'HEAD' || !upstream.body || undecoded) {
+        // Nothing to restore — or bytes still encoded in a way fetch could not undo: as they came,
+        // with their length (fetch changed nothing here).
+        const length = upstream.headers.get('content-length');
+        res.writeHead(upstream.status, length && (req.method === 'HEAD' || undecoded) ? { ...outHeaders, 'content-length': length } : outHeaders);
+        if (upstream.body && req.method !== 'HEAD') for await (const chunk of upstream.body) await write(chunk);
+        res.end();
+      } else if (/text\/event-stream/i.test(type)) {
         res.writeHead(upstream.status, outHeaders);
-        const parser = new SseParser();
+        res.flushHeaders(); // the client sees the stream start now, not with the first complete event
+        const parser = new SseParser(maxBody);
         const restorer = new SseRestorer(opts.vault, api);
         const decoder = new TextDecoder();
         for await (const chunk of upstream.body) {
-          for (const e of parser.feed(decoder.decode(chunk, { stream: true }))) for (const o of restorer.transform(e)) res.write(serialize(o));
+          for (const e of parser.feed(decoder.decode(chunk, { stream: true }))) for (const o of restorer.transform(e)) await write(serialize(o));
         }
-        for (const e of [...parser.feed(decoder.decode()), ...parser.end()]) for (const o of restorer.transform(e)) res.write(serialize(o));
-        for (const o of restorer.finish()) res.write(serialize(o));
-        res.end();
-      } else if (/ndjson|jsonl|json-seq|x-json-stream/i.test(type) && upstream.body) {
+        const final = parser.feed(decoder.decode());
+        const last = parser.end();
+        for (const e of [...final, ...last.events]) for (const o of restorer.transform(e)) await write(serialize(o));
+        for (const o of restorer.finish()) await write(serialize(o));
+        // An event cut off without its blank line: a client discards it, so it goes out as it was.
+        res.end(last.rest);
+      } else if (/ndjson|jsonl|json-seq|x-json-stream/i.test(type)) {
         // One JSON object per line (Ollama): restored line by line, as it streams.
         res.writeHead(upstream.status, outHeaders);
-        const nd = new NdjsonRestorer(opts.vault);
+        res.flushHeaders();
+        const nd = new NdjsonRestorer(opts.vault, maxBody);
         const decoder = new TextDecoder();
-        for await (const chunk of upstream.body) res.write(nd.feed(decoder.decode(chunk, { stream: true })));
+        for await (const chunk of upstream.body) await write(nd.feed(decoder.decode(chunk, { stream: true })));
         res.end(nd.feed(decoder.decode()) + nd.end());
-      } else if (/json/i.test(type)) {
-        const text = await upstream.text();
-        let out = text;
-        try {
-          out = JSON.stringify(restoreResponse(JSON.parse(text), opts.vault));
-        } catch {
-          // Not parseable after all: restore as JSON text (escaped), so it stays what it claims to be.
-          out = opts.vault.restore(text, jsonEncode);
-        }
-        res.writeHead(upstream.status, { ...outHeaders, 'content-length': String(Buffer.byteLength(out)) });
+      } else if (/json|^text\//i.test(type) || !type) {
+        const bytes = await readLimited(upstream.body, maxBody);
+        const text = new TextDecoder().decode(bytes);
+        let out: string | Uint8Array = text;
+        if (/json/i.test(type) || !type) {
+          try {
+            out = JSON.stringify(restoreResponse(parseJson(text), opts.vault, api));
+          } catch {
+            // Not parseable (or absurdly nested): as it came. A blind text restore could put real
+            // values inside signed thinking, or break the JSON. (Untyped and not JSON: raw bytes.)
+            out = type ? text : bytes;
+          }
+        } else out = opts.vault.restore(text);
+        res.writeHead(upstream.status, { ...outHeaders, 'content-length': String(typeof out === 'string' ? Buffer.byteLength(out) : out.length) });
         res.end(out);
       } else {
         res.writeHead(upstream.status, outHeaders);
-        if (upstream.body) for await (const chunk of upstream.body) res.write(chunk);
+        for await (const chunk of upstream.body) await write(chunk);
         res.end();
       }
     } catch (err) {
+      outcome = `response refused: ${(err as Error).message}`;
       if (!res.headersSent) send(res, 502, { error: (err as Error).message });
       else res.destroy(err as Error);
     }
     const summary = Object.entries(counts).map(([k, n]) => `${k} x${n}`).join(' ');
-    log(`${req.method} /${name}${path} -> ${upstream.status} ${Date.now() - t0}ms${summary ? `  redacted ${summary}` : ''}${note}`);
+    log(`${req.method} /${name}${path} -> ${outcome ?? upstream.status} ${Date.now() - t0}ms${summary ? `  redacted ${summary}` : ''}${note}`);
   }
+  // Agents are idle between turns. Node closes idle connections after 5 s by default, and a client
+  // reusing one at that moment gets ECONNRESET on a POST it will not retry. Clients' own idle
+  // timeouts are shorter than this, so they close first.
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
   return Object.assign(server, { stats });
 }

@@ -1,0 +1,25 @@
+{
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 1024,
+  "system": [{ "type": "text", "text": "You are a coding agent.", "cache_control": { "type": "ephemeral" } }],
+  "messages": [
+    { "role": "user", "content": "Deploy the app; the config is in .env." },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "thinking", "thinking": "I should read the .env file first.", "signature": "EqQBCkYIBxgCKkDsig" },
+        { "type": "tool_use", "id": "toolu_01", "name": "Read", "input": { "file_path": "/app/.env" } }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01",
+          "content": "OPENAI_API_KEY=sk-proj-Qw3rTy6uIo9pAs2dFg5hJk8lQw3rTy6uIo9pAs2dFg5hJk8l\nDATABASE_URL=postgres://app:Xq7-pL2m-Rt9@db.internal:5432/prod\nMAX_TOKENS=4096\nADMIN_EMAIL=li.wei@corp-mail.cn"
+        }
+      ]
+    }
+  ]
+}
