@@ -77,7 +77,9 @@ Your API key travels in headers, untouched — the provider needs it. Only reque
 
 `llm-redact detectors` lists all of them. Turn any off with `--disable email,phone` (or a whole kind: `--disable pii`), and keep specific values with `--allow`.
 
-What is **not** redacted on purpose: documentation placeholders (`your_api_key`, `${TOKEN}`, `<key>`, `changeme`), references (`process.env.X`, `os.environ[...]`), example domains and `noreply@` addresses, numbers that fail their checksum, commit hashes, UUIDs and timestamps.
+What is **not** redacted on purpose: documentation placeholders (`your_api_key`, `ghp_your_token`, `${TOKEN}`, `<key>`, `changeme`), references and code (`process.env.X`, `$API_KEY`, `config.token`, `getenv(…)`), token counts (`max_tokens=4096`), example domains and `noreply@` addresses, numbers that fail their checksum, commit hashes, UUIDs and timestamps.
+
+Measured, not assumed: over 2,955 real files (five popular public skill repositories plus three code projects), the generic `NAME=value` rule went from 317 hits — almost all code and placeholders — to 25, all of them password-shaped example values. Each false-positive class found there is a test.
 
 ## How it works
 
@@ -97,6 +99,7 @@ Supported wire formats: Anthropic Messages, OpenAI Chat Completions, OpenAI Resp
 | `llm-redact env [claude\|codex\|openai\|deepseek]` | What to set, for `--shell bash\|zsh\|fish\|powershell\|cmd` |
 | `llm-redact scan [file\|-]` | Preview what a file or paste would look like after redaction (`--json` for positions) |
 | `llm-redact detectors` | List detectors |
+| `llm-redact stats` | What a running proxy has redacted so far (counts only) |
 
 Options: `--upstream name=url` (repeatable) · `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--config file` · `-q`. A config file (`config.json` next to the key) takes the same settings: `{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [] }`.
 

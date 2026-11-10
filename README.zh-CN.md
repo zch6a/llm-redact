@@ -75,7 +75,9 @@ npx llm-redact env      # 按你的 shell 打印每个客户端要设置什么
 
 `llm-redact detectors` 列出全部检测器。用 `--disable email,phone` 关闭某些（或整类：`--disable pii`），用 `--allow` 保留特定值。
 
-**刻意不替换**的：文档里的占位写法（`your_api_key`、`${TOKEN}`、`<key>`、`changeme`）、变量引用（`process.env.X`、`os.environ[...]`）、示例域名和 `noreply@` 邮箱、校验不通过的数字、提交哈希、UUID 和时间戳。
+**刻意不替换**的：文档里的占位写法（`your_api_key`、`ghp_your_token`、`${TOKEN}`、`<key>`、`changeme`）、变量引用和代码（`process.env.X`、`$API_KEY`、`config.token`、`getenv(…)`）、token 计数（`max_tokens=4096`）、示例域名和 `noreply@` 邮箱、校验不通过的数字、提交哈希、UUID 和时间戳。
+
+这是实测得出的：在 2955 个真实文件（5 个流行的公开 skill 仓库加 3 个代码项目）上，通用的 `名字=值` 规则从 317 处命中（几乎全是代码和占位写法）降到 25 处，剩下的都是密码形态的示例值。实测中发现的每一类误报都写成了测试。
 
 ## 工作原理
 
@@ -95,6 +97,7 @@ npx llm-redact env      # 按你的 shell 打印每个客户端要设置什么
 | `llm-redact env [claude\|codex\|openai\|deepseek]` | 该设置什么，支持 `--shell bash\|zsh\|fish\|powershell\|cmd` |
 | `llm-redact scan [文件\|-]` | 预览一个文件或一段粘贴内容脱敏后的样子（`--json` 输出位置） |
 | `llm-redact detectors` | 列出检测器 |
+| `llm-redact stats` | 正在运行的代理截至目前替换了多少个值（只显示数量） |
 
 选项：`--upstream name=url`（可重复）· `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--config file` · `-q`。配置文件（与密钥同目录的 `config.json`）支持同样的设置：`{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [] }`。
 
