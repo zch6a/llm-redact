@@ -761,6 +761,8 @@ describe('round 4: remembered values across turns and restarts', () => {
       const file = join(dir, 'remembered');
       const before = fresh(43, { rememberFile: file });
       const ph = redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', before).hits[0]!.placeholder;
+      before.flushRemembered(); // the proxy's write happens right after the request (a microtask)
+      assert.ok(readFileSync(file, 'utf8').startsWith('# llm-redact remembered v1'), 'a format header');
       assert.ok(!readFileSync(file, 'utf8').includes('Tr0ub4dor'), 'no value on disk');
       const after = fresh(43, { rememberFile: file }); // a restarted proxy, same key
       const summary = 'Summary: the DB password is Tr0ub4dor-zq9xK; I connected with psql -W Tr0ub4dor-zq9xK.';
@@ -859,7 +861,7 @@ describe('round 4: a response restores only its own request', () => {
     await post(base, '/mock/v1/messages', JSON.stringify({ model: 'm', max_tokens: 1, messages: [{ role: 'user', content: `Summary: ${r1.content[0]?.text}` }] }), { 'content-type': 'application/json' });
     noLeak(lastRaw, 'Tr0ub4dor-zq9xK');
   });  it('#11 a scope keeps its values even when the vault forgets them mid-response', () => {
-    const w = new Vault(Buffer.alloc(32, 53), 10);
+    const w = new Vault(Buffer.alloc(32, 53), { maxEntries: 10 });
     const ph = w.placeholderFor('openai_key', SECRET);
     const scope = w.scope([ph]);
     for (let i = 0; i < 50; i++) w.placeholderFor('email', `u${i}@corp-mail.cn`);
@@ -950,5 +952,156 @@ describe('round 4: config and key files', () => {
 describe('round 5: fast paths keep their promises', () => {
   it('parseJson takes the slow path for every number JSON.parse would change, the fast one otherwise', { skip: typeof (JSON as { rawJSON?: unknown }).rawJSON !== 'function' && 'needs JSON.rawJSON' }, () => {
     for (const s of ['{"a":12345678901234567890}', '{"a":1.10}', '{"a":1e5}', '{"a":-0}', '{"a":1.5E3}', '{"a":0.12345678901234567891}', '{"a":1.25,"b":[1,2,3],"c":-7}', '{"a":100,"b":"1.10 in a string"}']) assert.equal(JSON.stringify(parseJson(s)), s);
+  });
+});
+describe('round 5: the fifth review', () => {
+  it('#1 thousands of new values in one request do not stall the proxy', () => {
+    const w = new Vault(Buffer.alloc(32, 61));
+    const tok = (i: number) => `t${i}Ab3dEf6hIj9kLm2nOp5qRs8`;
+    let t0 = Date.now();
+    redactRequest({ model: 'm', messages: Array.from({ length: 2000 }, (_, i) => ({ role: 'user', content: `Authorization: Bearer ${tok(i)}` })) }, w, 'anthropic');
+    assert.ok(Date.now() - t0 < 2000, `2,000 messages: ${Date.now() - t0} ms (was 16 s)`);
+    t0 = Date.now();
+    const input = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [`k${i}_token`, `u${i}Ab3dEf6hIj9kLm2nOp5qRs8`]));
+    const out = JSON.stringify(redactRequest({ model: 'm', messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'n', input }] }] }, w, 'anthropic').body);
+    assert.ok(Date.now() - t0 < 2000, `1,000 fields: ${Date.now() - t0} ms (was 3.5 s)`);
+    noLeak(out, 'u999Ab3dEf6hIj9kLm2nOp5qRs8');
+  });
+  it('#2 random tokens are caught (base64url, any first character); flags and identifiers are not', () => {
+    let seed = 7;
+    const bytes = (n: number) => Buffer.from(Array.from({ length: n }, () => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 24)));
+    for (const ctx of [(t: string) => `Authorization: Bearer ${t}`, (t: string) => `API_TOKEN=${t}`, (t: string) => `{"password": "${t}"}`]) {
+      let missed = 0;
+      for (let i = 0; i < 1500; i++) {
+        if (i % 300 === 0) seed = seed ^ 0x5bd1e995;
+        const t = bytes(16 + (i % 16)).toString('base64url');
+        if (redactText(ctx(t), new Vault(Buffer.alloc(32, 62))).text.includes(t)) missed++;
+      }
+      assert.ok(missed <= 4, `${missed} of 1500 missed in ${ctx('X')}`);
+    }
+    for (const t of ['--max-tokens', 'MAX_RETRY_COUNT', 'ForgotPassword', 'getElementById', 'YOUR_API_KEY_HERE', 'sk-your-key-here'])
+      assert.equal(redactText(`API_TOKEN=${t}`, new Vault(Buffer.alloc(32, 63))).text, `API_TOKEN=${t}`, t);
+    // The reviewer's misses: a mixed-case token that reads as "a" + suffixes, and one whose last segment is "MY".
+    for (const t of ['a_OY3uGb6meHgmQAi3u_xrFDz2VDO9Db', 'B5Hpl9XP5vDmHdKCzV-6mg221_MY']) noLeak(redactText(`API_TOKEN=${t}`, new Vault(Buffer.alloc(32, 63))).text, t);
+    // A connection string: the password is redacted and the rest of it kept.
+    assert.match(redactText('Server=db;User Id=sa;Password=Xq7pL2mRt9w;Pool Size=5', new Vault(Buffer.alloc(32, 64))).text, /Password=\[\[REDACTED:secret_assignment:[0-9a-f]{8}\]\];Pool Size=5$/);
+    // A connection string's value ends at ';', and an index expression is code.
+    for (const t of ['Server=localhost;Database=MyDb;User Id=sa;Password=xxx;Pool Size=5', 'chunk_tokens = tokens[start:start + chunk_size]'])
+      assert.equal(redactText(t, new Vault(Buffer.alloc(32, 64))).text, t);
+  });
+  it('a cached text is redone when a value learned later hides in a base64 token in it', () => {
+    const w = new Vault(Buffer.alloc(32, 68));
+    const cache = new RedactCache();
+    const b64 = Buffer.from('admin:Tr0ub4dor-zq9xK').toString('base64');
+    const text = 'x'.repeat(1100) + ` > Authorization: Basic ${b64}`;
+    assert.ok(redactText(text, w, { cache }).text.includes(b64), 'nothing known yet');
+    redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', w, { cache });
+    noLeak(redactText(text, w, { cache }).text, b64);
+  });  it('#3 after a restart, remembered values with = or : in them are recalled too', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'llm-redact-recall-'));
+    try {
+      const file = join(dir, 'remembered');
+      const before = new Vault(Buffer.alloc(32, 65), { rememberFile: file });
+      redactText('DB_PASSWORD="Tr0ub:4dor-zq9x"\nAPI_SECRET="Tr0ub=4dor-zq9y"', before);
+      before.flushRemembered();
+      const after = new Vault(Buffer.alloc(32, 65), { rememberFile: file });
+      noLeak(redactText('psql -W Tr0ub:4dor-zq9x; PGPASSWORD=Tr0ub=4dor-zq9y (and [Tr0ub:4dor-zq9x])', after).text, '4dor-zq9x', '4dor-zq9y');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('#4 placeholders a response could not restore are counted in the log; scopes are per upstream', async () => {
+    const lines: string[] = [];
+    const w = new Vault(Buffer.alloc(32, 66));
+    const base = await start({ vault: w, log: (l) => lines.push(l), upstreams: { mock: up, other: up } });
+    const ph = w.placeholderFor('email', EMAIL);
+    await post(base, '/mock/r4/say', JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }), { 'content-type': 'application/json', 'x-reply': `to ${ph}` });
+    assert.match(lines.at(-1) ?? '', /unrestored 1/);
+    // A response id of one upstream does not open its scope to another.
+    await post(base, '/mock/r4/say/responses', JSON.stringify({ model: 'm', input: [{ role: 'user', content: `mail ${EMAIL}` }] }), { 'content-type': 'application/json', 'x-reply': 'ok', 'x-id': 'resp_9' });
+    const r = (await (await post(base, '/other/r4/say/responses', JSON.stringify({ model: 'm', previous_response_id: 'resp_9', input: [] }), { 'content-type': 'application/json', 'x-reply': `to ${ph}` })).json()) as { output_text: string };
+    assert.equal(r.output_text, `to ${ph}`);
+  });
+  it('#6 a body forwarded unredacted is reported even without a log', async () => {
+    const warned: string[] = [];
+    const base = await start({ allowUnredacted: true, warn: (l) => warned.push(l) });
+    await post(base, '/mock/v1/files', new Uint8Array([1, 2, 3]), { 'content-type': 'application/octet-stream' });
+    assert.match(warned.join('\n'), /UNREDACTED/);
+  });
+  it('#7 a form field is judged by its name, as a JSON key is', () => {
+    const r = redactForm('username=li&password=Tr0ub4dor-zq9x&client_secret=Zq8mW3pL7vT2kQx9', new Vault(Buffer.alloc(32, 67)));
+    noLeak(decodeURIComponent(r.text), 'Tr0ub4dor-zq9x', 'Zq8mW3pL7vT2kQx9');
+    assert.ok(r.text.startsWith('username=li&'));
+  });
+  it('#12 web pages of other sites are refused; agents (no Origin) and local web apps are not', async () => {
+    const ok = (o?: string, site?: string) => post(px, '/mock/v1/messages', msg, { 'content-type': 'text/plain', ...(o ? { origin: o } : {}), ...(site ? { 'sec-fetch-site': site } : {}) }).then((r) => r.status);
+    assert.equal(await ok('https://evil.example'), 403);
+    assert.equal(await ok('null'), 403);
+    assert.equal(await ok(undefined, 'cross-site'), 403);
+    assert.equal(await ok('http://localhost:3000'), 200);
+    assert.equal(await ok(), 200);
+  });
+  it('errors have the shape both SDKs read: { type: "error", error: { type, message } }', async () => {
+    const res = await post(px, '/mock/v1/messages', '{', { 'content-type': 'application/json' });
+    const body = (await res.json()) as { type: string; error: { type: string; message: string } };
+    assert.equal(res.status, 400);
+    assert.equal(body.type, 'error');
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /^llm-redact/);
+  });
+  it('config: a typo is an error, a setting of a newer version a warning; types and upstream names are checked', () => {
+    const d = mkdtempSync(join(tmpdir(), 'llm-redact-cfg5-'));
+    const orig = console.error;
+    const errs: string[] = [];
+    console.error = (...a: unknown[]) => void errs.push(a.join(' '));
+    try {
+      const f = join(d, 'config.json');
+      writeFileSync(f, '{ "requireTokn": true }');
+      assert.throws(() => readConfigFile(f, false), /did you mean/);
+      writeFileSync(f, '{ "someFutureSetting": 1, "maxBody": 128 }');
+      assert.deepEqual(readConfigFile(f, false), { someFutureSetting: 1, maxBody: 128 });
+      assert.match(errs.join('\n'), /unknown setting "someFutureSetting" ignored/);
+      writeFileSync(f, '{ "maxBody": "big" }');
+      assert.throws(() => readConfigFile(f, false), /wrong type/);
+      writeFileSync(f, '{ "upstreams": { "My Gateway": "https://x.example" } }');
+      assert.throws(() => readConfigFile(f, false), /wrong type/);
+    } finally {
+      console.error = orig;
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+  it('#11 one reasoning rule, streamed or not: signed parts stay, unsigned reasoning text is restored', () => {
+    const ph = v.placeholderFor('secret_assignment', TRICKY);
+    // Gemini: a part with a thought signature is left alone; an unsigned thought part is restored — both ways.
+    const body = { candidates: [{ content: { parts: [{ text: `a ${ph}`, thought: true, thoughtSignature: 'sig' }, { text: `b ${ph}`, thought: true }] } }] };
+    const plain = restoreResponse(body, v) as { candidates: { content: { parts: { text: string }[] } }[] };
+    const r = new SseRestorer(v, 'other');
+    const streamed = JSON.parse(r.transform({ head: [], data: JSON.stringify({ ...body, candidates: [{ ...body.candidates[0], finishReason: 'STOP' }] }) })[0]!.data ?? '{}');
+    for (const parts of [plain.candidates[0]!.content.parts, streamed.candidates[0].content.parts]) {
+      assert.equal(parts[0]!.text, `a ${ph}`);
+      assert.equal(parts[1]!.text, `b ${TRICKY}`);
+    }
+    // Request side: the signed part goes upstream as it came.
+    const req = { contents: [{ role: 'model', parts: [{ text: `about ${EMAIL}`, thought: true, thoughtSignature: 'sig' }] }] };
+    assert.deepEqual(redactRequest(req, v, 'other').body, req);
+  });
+});
+describe('round 5: the cache after a request that taught a value', () => {
+  it('the next request redoes only new text (a newer result replaces the stale one)', () => {
+    const w = new Vault(Buffer.alloc(32, 69));
+    const cache = new RedactCache();
+    let sets = 0;
+    const set = cache.set.bind(cache);
+    cache.set = (t, r) => {
+      sets++;
+      set(t, r);
+    };
+    const big = (s: string) => 'x'.repeat(1200) + '\n' + s; // (a newline: glued on, the x's would be part of the name)
+    const history: unknown[] = [{ role: 'user', content: big('DB_PASSWORD=Tr0ub4dor-zq9xK') }, { role: 'user', content: big('nothing here') }];
+    redactRequest({ model: 'm', messages: history }, w, 'anthropic', { cache });
+    history.push({ role: 'user', content: big('a new tool result') });
+    sets = 0;
+    redactRequest({ model: 'm', messages: history }, w, 'anthropic', { cache });
+    assert.equal(sets, 1, 'only the new text is redacted; the one that taught the password comes from the cache');
   });
 });

@@ -8,7 +8,7 @@
 
 Claude Code · Codex · OpenCode · DeepSeek · 任何兼容 OpenAI 或 Anthropic 接口的客户端
 
-本地运行 · 零依赖 · 除一个随机密钥外什么都不落盘
+本地运行 · 零依赖 · 真实值从不写入磁盘
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
@@ -91,12 +91,12 @@ npx llm-redact env      # 按你的 shell 打印每个客户端要设置什么
 - **会看进 base64 里。** `curl -v` 打印的 `Authorization: Basic …` 里藏着你被还原的密码；解码后含有密钥的整个 token 会被替换。
 - **流式输出。** 一个占位符可能被拆在任意多段流式输出里（`[[RED` + `ACTED:op…`）。还原器只暂扣“还可能变成占位符”的那一小截尾巴，普通文字不会被延迟；即使还原出的值含有引号或反斜杠，工具调用参数也仍然是合法 JSON。
 - **编码过的文本也会搜索。** 工具结果常常引用日志、配置和 API 响应，所以文本还会往下解一到两层再搜索——各种写法的 JSON 转义（`\"`、Go 的 `\u0026`、.NET 的 `\u002B`、Python 的 `\u00e4`）、HTML 实体、百分号编码、CSV 里双写的引号、shell 和 Python 的引号转义（`'\''`、`\'`）——在那里找到的值会在原文中对应的位置被精确替换。写成 JSON 数字的卡号和手机号也能识别；其他数字按原样保留（`12345678901234567890`、`1.10`）。请求里已有的占位符（模型此前自己的输出）不会被再次脱敏。
-- **带签名的块原样保留。** 带签名的 Anthropic thinking 块、OpenAI / OpenRouter 的加密推理（包括其摘要）会被服务商逐字节校验，两个方向都绝不修改。没有签名的推理文本（DeepSeek 的 `reasoning_content`）按普通文本处理。
-- **告诉模型发生了什么。** 请求里有占位符时，会在系统提示词末尾追加一句说明（让模型原样写出占位符，而不是向你要 key）。追加在末尾不会破坏已缓存的前缀。`--no-note` 可关闭。
+- **带签名的块原样保留。** Anthropic 的 thinking 块、OpenAI 的推理项（包括摘要）、OpenRouter 的推理详情，以及带思考签名（thought signature）的 Gemini 片段，会被服务商逐字节校验（或必须原样传回），流式和非流式都绝不修改。普通的推理*文本*——DeepSeek 的 `reasoning_content`、Ollama 的 `thinking`、不带签名的 Gemini 思考——按普通文本处理，照常脱敏和还原。
+- **告诉模型发生了什么。** 已知格式（Anthropic、Chat Completions、Responses）的请求里有占位符时，会在系统提示词末尾追加一句说明（让模型原样写出占位符，而不是向你要 key）。追加在末尾不会破坏已缓存的前缀。`--no-note` 可关闭。其他格式（Ollama、Gemini）不加说明：llm-redact 不知道怎么扩展它们的系统提示词。
 
 - **出错时宁可拒绝（fail closed）。** 无法脱敏的请求体会被拒绝，绝不原样转发：不合法的 JSON → 400；嵌套深得离谱、压缩后解压超过上限、或一段文本里要替换的值超过一百万个 → 413；文件上传等二进制内容、或非 UTF-8 字符集的文本 → 415（用 `--allow-unredacted` 启动可以让这类请求原样转发，日志会逐条标注）。纯文本请求体按文本脱敏，表单请求体逐字段脱敏。重定向到同一上游以外的地址会被拒绝，因为客户端会把原始的、未脱敏的请求体重新发到那里。
 
-支持的接口格式：Anthropic Messages（也包括经 Vertex AI 的 `:streamRawPredict`）、OpenAI Chat Completions、OpenAI Responses——流式和非流式都支持，包括工具输入、工具结果、历史工具调用参数、Predicted Outputs 和 Codex 的自定义工具；以 base64 发送的文本文件也会脱敏。其他任何 JSON 接口（Ollama、Gemini 等）按通用方式脱敏——所有字符串和对象键——响应也会还原：Gemini 和旧版 completions 的流、逐行 JSON 流（Ollama），以及未识别路径上的 SSE 流。响应保留直连时的一切——数字按原样（不丢精度）、每一个 `Set-Cookie`、事件 id 和序号（为暂扣文本插入的事件取下一个序号，后面的依次后移）；没有正常结束标记的流也不会丢任何字符。响应大小与请求体上限相同（默认 64 MB）：永不结束的上游会被切断，而不是一直缓存。
+支持的接口格式：Anthropic Messages（也包括经 Vertex AI 的 `:streamRawPredict`）、OpenAI Chat Completions、OpenAI Responses——流式和非流式都支持，包括工具输入、工具结果、历史工具调用参数、Predicted Outputs 和 Codex 的自定义工具；以 base64 发送的文本文件也会脱敏。其他任何 JSON 接口（Ollama、Gemini 等）按通用方式脱敏——所有字符串和对象键——响应也会还原：Gemini 和旧版 completions 的流、逐行 JSON 流（Ollama），以及未识别路径上的 SSE 流。响应保留直连时的一切——数字按原样（不丢精度）、每一个 `Set-Cookie`、事件 id 和序号（为暂扣文本插入的事件取下一个序号，后面的依次后移）；没有正常结束标记的流也不会丢任何字符。大小受 `--max-body` 限制（默认 64 MB）：请求体、非流式响应体，以及流式响应中的每一个事件或每一行（整个流可以一直进行下去）——一个事件永不结束的上游会被切断，而不是一直缓存。
 
 有意不改动的部分：**工具定义和输出 schema**（由客户端编写，相当于它的代码，并且要逐字节稳定以保证 prompt 缓存命中）、请求设置（`stop`、`safety_identifier`、`mcp_servers`）、带签名的块，以及二进制文件（图片、PDF）。
 
@@ -111,9 +111,23 @@ npx llm-redact env      # 按你的 shell 打印每个客户端要设置什么
 | `llm-redact detectors` | 列出检测器 |
 | `llm-redact stats` | 正在运行的代理截至目前替换了多少个值（只显示数量） |
 
-选项：`--upstream name=url`（可重复）· `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--require-token` · `--allow-unredacted` · `--config file` · `-q`。配置文件（与密钥同目录的 `config.json`）支持同样的设置：`{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [], "requireToken": false, "allowUnredacted": false }`。
+选项：`--upstream name=url`（可重复）· `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--require-token` · `--allow-unredacted` · `--max-body MB` · `--config file` · `-q`。配置文件（与密钥同目录的 `config.json`）支持同样的设置：`{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [], "note": true, "requireToken": false, "allowUnredacted": false, "maxBody": 64 }`。文件损坏、类型不对或名字差一点（`requireTokn`）都是错误；完全不认识的名字只是警告（可能来自更新的版本）。这些文件放在 `~/.config/llm-redact`（Windows 上是 `%APPDATA%\llm-redact`），设置了 `$LLM_REDACT_HOME` 时放在那里。
 
-请求日志只显示数量——`POST /anthropic/v1/messages -> 200 1834ms  redacted openai_key x1 email x2`——从不显示请求体或具体值。
+会削弱保护的设置——`--allow-unredacted`、被关闭的检测器、`--allow` 的值、以及它用不了的 `HTTPS_PROXY`——每次启动都会以警告打印出来；每一个未经脱敏转发的请求体都会在 stderr 报告，`-q` 时也一样。
+
+请求日志只显示数量——`POST /anthropic/v1/messages -> 200 1834ms  redacted openai_key x1 email x2`——从不显示请求体或具体值。 行尾的 `unrestored 2` 表示响应里有它的请求没有带着的占位符：它们原样到达了客户端（见下面的“重启”）。
+
+llm-redact 自己的错误采用两种 SDK 都能读懂的格式：`{ "type": "error", "error": { "type": "invalid_request_error", "message": "llm-redact: …" } }`，状态码说明发生了什么：400 不是 JSON，403 不允许，413 太大或嵌套太深，415 无法脱敏，502 上游连不上或回复有问题。
+
+## 性能
+
+脱敏在代理的单线程里进行，所以一个请求在脱敏时会让其他请求等这么久。一个新的 2 MB 请求大约 140 ms（重启后还有 5,000 个记住的值等待匹配时约 420 ms）；agent 下一轮再次发送的内容都来自缓存，所以一个进行中的会话里 1 MB 的请求只要几毫秒。用 `npm run soak` 测得（四个 agent、数百轮：延迟平稳，存活内存约 60 MB）。
+
+## 重启和升级
+
+- 密钥和 `remembered` 哈希在重启后保留：占位符不变，prompt 缓存继续命中，记住的值也能再次被认出。
+- 缓存、内存里的值和每个响应的还原范围不保留。值会随下一个带着它的请求回来。跨重启用 `previous_response_id` 继续的 Responses API 对话——或者把历史放在服务端的对话（`conversation`）——会收到它已无法还原的占位符：原样传出，并在日志里计数（`unrestored`）。
+- 识别得更多（或更少）的新版本会改变相关值的占位符：一次 prompt 缓存未命中。
 
 ## 安全
 
@@ -129,10 +143,16 @@ npx llm-redact env      # 按你的 shell 打印每个客户端要设置什么
 - **上传的文件和二进制文件不脱敏。** 以 `multipart/form-data` 发送的请求会被拒绝；如果传了 `--allow-unredacted`，则原样发出。请求里的图片和 PDF 原样通过（以 base64 发送的文本文件会脱敏）。
 - **工具定义不脱敏。** 写进 MCP 服务器工具描述里的密钥会随之发出。
 - **类型为 `application/json` 的响应会整体读完再还原**（被错误标成这种类型的流，会在最后一次性到达）。
+- **不支持：** WebSocket 传输（通过 WebSocket 与服务商通信的客户端不经过代理的脱敏）。llm-redact **直接**连接上游：Node 的 `fetch` 不使用 `HTTPS_PROXY`，所以如果只能通过 HTTP 代理访问服务商，请求会失败（502）。服务商超过 5 分钟才开始回复的非流式请求会被 Node 的 `fetch` 切断——长请求请用流式。
+- **只由字母组成的 token** 可能看起来像标识符（`ForgotPassword`），通用的 `NAME=value` 规则不能把它当成密钥：随机的纯字母 token 大约每 13 个漏掉 1 个。20 个字符以上的随机 token 几乎总带数字或符号，所以总体上随机 base64 token 大约每 1,500 个漏掉 1 个；服务商的 key（`sk-…`、`ghp_…` 等）按形态识别，不受影响。
 - 没有可识别形态、周围也没有提示性名字的密钥识别不出来——除非它之前带着名字出现过：被记住的值在任何地方都能被找到。但途中*被改动*的值认不出来：跨行折断、换了格式（电话号码换种写法打印）、或被故意变换（转十六进制、倒序、拆开）——模型总能对拿到的值这样做，llm-redact 只看常见编码（JSON、HTML、百分号、CSV、shell 引号、base64）。
 - **只管经过代理的流量。** Agent 自己运行的工具（网页抓取、`curl`）不经过它。
 - **占位符在你这边被还原——不管是谁写的。** 这是设计本身：模型把 `[[REDACTED:…]]` 写进命令或文件，真实值落到你的机器上。这也意味着被提示注入（网页、README、工具结果）劫持的 agent 仍可能被诱导去使用还原后的密钥——比如用 `curl` 把它发到别处。llm-redact 让密钥不进入*服务商*，但并不能让一个够得着密钥的 agent 变得安全。
 - 模型看到的是占位符，所以它无法根据密钥的*内容*推理（比如“这是测试环境还是生产环境的 key？”）。这正是目的所在。
+
+## 兼容性
+
+从 1.0 起，占位符、标签、磁盘上的文件、配置项、命令行参数、退出码、JSON 输出和错误响应在 1.x 内保持稳定——具体承诺什么、哪些（识别结果、日志行）可以在小版本中改进，见 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
 ## 运行要求
 

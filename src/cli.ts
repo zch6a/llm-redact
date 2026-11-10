@@ -31,6 +31,7 @@ Options
       --no-note              do not tell the model what the placeholders are
       --require-token        only answer under a random path token (for machines with other users)
       --allow-unredacted     forward bodies that cannot be redacted (uploads) instead of refusing them
+      --max-body <MB>        largest request body, and largest response or streamed event (default 64)
       --config <file>        settings file (default: ${join(dirname(defaultKeyPath()), 'config.json')})
   -q, --quiet                no request log
       --json                 scan: machine-readable output
@@ -39,7 +40,8 @@ Options
       --shell <name>         env: bash, zsh, fish, powershell, cmd (default: from your platform)
   -h, --help / --version
 
-Nothing is stored on disk except a random key for stable placeholders. Values stay in memory.
+Values stay in memory. On disk: a random key for stable placeholders, keyed hashes of
+remembered values (never the values), and with --require-token the token.
 `;
 
 const OPTIONS = {
@@ -51,6 +53,7 @@ const OPTIONS = {
   'no-note': { type: 'boolean' },
   'allow-unredacted': { type: 'boolean' },
   'require-token': { type: 'boolean' },
+  'max-body': { type: 'string' },
   config: { type: 'string' },
   quiet: { type: 'boolean', short: 'q' },
   json: { type: 'boolean' },
@@ -86,6 +89,8 @@ interface Config {
   port: number;
   token?: string;
   allowUnredacted: boolean;
+  /** Bytes. */
+  maxBody: number;
   upstreams: Record<string, string>;
   redact: RedactOptions & { note?: boolean };
 }
@@ -112,7 +117,8 @@ function loadToken(): string {
 /** What each config file setting must be. */
 const CONFIG_TYPES: Record<string, (x: unknown) => boolean> = {
   port: (x) => Number.isInteger(x),
-  upstreams: (x) => typeof x === 'object' && x !== null && !Array.isArray(x) && Object.values(x).every((u) => typeof u === 'string' && /^https?:\/\//.test(u)),
+  upstreams: (x) => typeof x === 'object' && x !== null && !Array.isArray(x) && Object.entries(x).every(([k, u]) => /^[a-z0-9_-]+$/.test(k) && typeof u === 'string' && /^https?:\/\//.test(u)),
+  maxBody: (x) => typeof x === 'number' && x > 0 && x <= 4096,
   disable: (x) => Array.isArray(x) && x.every((s) => typeof s === 'string'),
   enable: (x) => Array.isArray(x) && x.every((s) => typeof s === 'string'),
   allow: (x) => Array.isArray(x) && x.every((s) => typeof s === 'string'),
@@ -142,7 +148,14 @@ export function readConfigFile(file: string, explicit: boolean): Record<string, 
   if (typeof cfg !== 'object' || cfg === null || Array.isArray(cfg)) throw new UsageError(`${file} must hold a JSON object`);
   for (const [k, x] of Object.entries(cfg)) {
     const ok = CONFIG_TYPES[k];
-    if (!ok) throw new UsageError(`${file}: unknown setting "${k}"${didYouMean(k, Object.keys(CONFIG_TYPES))}`);
+    if (!ok) {
+      // A near miss is a typo to fix ("requireTokn" would silently drop the token); anything else may be
+      // a setting of a newer version: said, and ignored.
+      const near = didYouMean(k, Object.keys(CONFIG_TYPES));
+      if (near) throw new UsageError(`${file}: unknown setting "${k}"${near}`);
+      console.error(`llm-redact: warning: ${file}: unknown setting "${k}" ignored (from a newer version?)`);
+      continue;
+    }
     if (!ok(x)) throw new UsageError(`${file}: "${k}" has the wrong type (${JSON.stringify(x)})`);
   }
   return cfg as Record<string, unknown>;
@@ -165,14 +178,16 @@ export function loadConfig(v: Values): Config {
   const port = Number(v.port ?? fileCfg.port ?? 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`bad port ${v.port}`);
   const requireToken = !!v['require-token'] || fileCfg.requireToken === true;
-  return { port, upstreams, allowUnredacted: !!v['allow-unredacted'] || fileCfg.allowUnredacted === true, ...(requireToken ? { token: loadToken() } : {}), redact: { disable, enable, allow: [...strs(fileCfg.allow), ...(v.allow ?? [])], note: v['no-note'] ? false : fileCfg.note !== false } };
+  const maxBodyMb = v['max-body'] !== undefined ? Number(v['max-body']) : ((fileCfg.maxBody as number | undefined) ?? 64);
+  if (!(maxBodyMb > 0 && maxBodyMb <= 4096)) throw new UsageError(`--max-body wants megabytes between 1 and 4096, got ${v['max-body']}`);
+  return { port, upstreams, maxBody: Math.round(maxBodyMb * 1024 * 1024), allowUnredacted: !!v['allow-unredacted'] || fileCfg.allowUnredacted === true, ...(requireToken ? { token: loadToken() } : {}), redact: { disable, enable, allow: [...strs(fileCfg.allow), ...(v.allow ?? [])], note: v['no-note'] ? false : fileCfg.note !== false } };
 }
 
 function cmdStart(v: Values): Promise<number> {
   const cfg = loadConfig(v);
   // Values found by their context are remembered across restarts — as keyed hashes, never values.
   const vault = new Vault(loadKey(), { rememberFile: join(dirname(defaultKeyPath()), 'remembered') });
-  const server = createProxy({ vault, upstreams: cfg.upstreams, redact: cfg.redact, allowUnredacted: cfg.allowUnredacted, ...(cfg.token ? { token: cfg.token } : {}), log: v.quiet ? undefined : (l) => console.log(l) });
+  const server = createProxy({ vault, upstreams: cfg.upstreams, redact: cfg.redact, maxBody: cfg.maxBody, allowUnredacted: cfg.allowUnredacted, ...(cfg.token ? { token: cfg.token } : {}), log: v.quiet ? undefined : (l) => console.log(l) });
   return new Promise((resolveExit) => {
     server.on('error', (err: NodeJS.ErrnoException) => {
       console.error(err.code === 'EADDRINUSE' ? `Port ${cfg.port} is in use - is llm-redact already running? Try --port.` : err.message);
@@ -182,6 +197,16 @@ function cmdStart(v: Values): Promise<number> {
       console.log(`llm-redact ${VERSION} listening on http://127.0.0.1:${cfg.port}${cfg.token ? '/<token> (--require-token: see llm-redact env)' : ''}`);
       // ASCII only: this is the first thing people see, often in a console that is not UTF-8.
       for (const [name, url] of Object.entries(cfg.upstreams)) console.log(`  /${name.padEnd(10)} -> ${url}`);
+      // Settings that weaken protection are said at every start, wherever they came from (a config file
+      // is easy to forget). On stderr, so -q does not hide them.
+      const weak: string[] = [];
+      if (cfg.allowUnredacted) weak.push('--allow-unredacted: uploads and other bodies that cannot be redacted are forwarded AS THEY ARE');
+      if (cfg.redact.disable?.length) weak.push(`detectors turned off: ${cfg.redact.disable.join(', ')}`);
+      if (cfg.redact.allow?.length) weak.push(`${cfg.redact.allow.length} value(s) never redacted (--allow / config)`);
+      // Node's fetch does not use HTTP(S)_PROXY: upstream connections go direct.
+      const outbound = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy;
+      if (outbound) weak.push(`HTTPS_PROXY / HTTP_PROXY is set, but llm-redact connects to the upstreams directly (Node's fetch does not use those variables). If the provider is only reachable through that proxy, requests will fail with 502.`);
+      for (const w of weak) console.error(`llm-redact: warning: ${w}`);
       console.log(`Run \`llm-redact env\` to see what to set in your agent. Ctrl+C to stop.`);
     });
     const stop = () => {

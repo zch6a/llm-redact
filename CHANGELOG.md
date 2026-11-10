@@ -2,6 +2,33 @@
 
 All notable changes are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [1.0.0] — 2026-11-11
+
+The first stable release. A fifth independent review asked one question — would you trust this with your keys? — and answered "after these fixes". They are all in, each with a test, and every fix was undone once in a copy of the code to make sure the suite fails without it (21 mutations, all caught). What 1.x keeps stable is written down in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
+
+### Fixed
+
+- **A request with thousands of new values no longer stalls the proxy.** Every newly learned value rebuilt the remembered-value pattern for the next string — quadratic, and the proxy is single-threaded: 2,000 messages with one bearer token each took 16 s (every agent on the proxy waited). The pattern is now built once per walk over a request; values learned during it are picked up by the second walk. 67 ms. The `remembered` file is written once per request instead of once per value.
+- **About 2% of random tokens were not redacted** after `Bearer`, `API_TOKEN=` or under a `"password"` key: base64url values starting with `-` (taken for command-line flags) and mixed-case values read as documentation placeholders (`a_OY3u…` as "a" plus suffixes, `…_MY` as the word "my"). Now about 1 in 1,500, the rest being letters-only tokens that look like identifiers (documented).
+- **After a restart, remembered values containing `=` or `:` were not recalled**: tokens are now split on whitespace and quotes only, and the part after a last `=` or `:` is tried too.
+- **Form fields are judged by their name**, as JSON keys are: `password=…&client_secret=…` is redacted.
+- Connection strings: a value ends at `;` (`Password=…;Pool Size=5` keeps the rest); an index expression left open (`tokens[start:`) is code, not a secret.
+- **Faster**: the cache records once per entry whether a text holds base64 (it was rescanned for every cached text whenever a turn learned a value), and exact-number parsing runs only when a number would change — a running session's 1 MB request is back to ~65 ms in the soak test.
+
+### Security
+
+- **Placeholders a response could not restore are counted** (`unrestored N` in the log line) instead of reaching the client unnoticed — e.g. a Responses conversation continued with `previous_response_id` across a restart. Response scopes are kept per upstream.
+- **Web pages of other sites are refused** (a non-loopback `Origin`, or `Sec-Fetch-Site: cross-site`): a page could otherwise POST through the proxy to an upstream that needs no key.
+- **Settings that weaken protection are said at every start** (`--allow-unredacted`, turned-off detectors, `--allow` values, an `HTTPS_PROXY` the proxy cannot use), and every body forwarded unredacted is reported on stderr, also with `-q`.
+- **Gemini parts with a thought signature** go back exactly as they came; one written rule for reasoning, streamed or not: signed blocks are never touched, plain reasoning text is redacted and restored like any text.
+
+### Changed (settled for 1.0)
+
+- Errors from llm-redact have the shape both SDKs read: `{ "type": "error", "error": { "type", "message" } }`.
+- Config: a setting from a newer version is a warning (a near-miss name is still an error); `maxBody` (and `--max-body`); upstream names are checked as on the command line.
+- The `remembered` file starts with a format header line.
+- README: what is stored, size limits, the note (not added for unknown formats), `LLM_REDACT_HOME`, new sections on performance, restarts and upgrades, and what is not supported (WebSockets, outbound HTTP proxies, non-streamed requests over 5 minutes).
+
 ## [0.5.0] — 2026-11-11
 
 A fourth independent review looked at the system over time — across turns, sessions and restarts — and found 16 problems, all reproduced. All are fixed, each with a test; every fix was undone once in a copy of the code to make sure the suite fails without it. A new soak test runs concurrent agents for hundreds of turns.
@@ -17,7 +44,7 @@ A fourth independent review looked at the system over time — across turns, ses
 - Percent-encoding of any character, and shell / Python quoting (`'\''`, `\'`), are decoded views now.
 - A cached result is no longer reused when a value learned later appears in it in an encoded form.
 - A broken default `config.json` (a trailing comma) or a mistyped setting (`"requireToken": "true"`) is an error instead of silently turning `--require-token` off.
-- Key and token files: written owner-only before anything is in them, replacing explicit ACL entries too (`icacls /reset`); created atomically (processes starting at once agree on one key); an existing key that does not parse is refused, never overwritten; a warning when the ACL cannot be set; the folder is owner-only when created.
+- Key and token files: written owner-only before anything is in them, replacing explicit ACL entries too (a fresh temporary file is renamed over the target); created atomically (processes starting at once agree on one key); an existing key that does not parse is refused, never overwritten; a warning when the ACL cannot be set; the folder is owner-only when created.
 - The access token no longer appears in the log on an internal error.
 
 ### Added

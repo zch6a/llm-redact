@@ -1,6 +1,6 @@
 {
   "name": "llm-redact",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "description": "A local proxy that redacts API keys, tokens and personal data from your AI agent's requests before they leave your machine, and restores them in the responses. Claude Code, Codex, OpenCode, DeepSeek. Zero dependencies.",
   "keywords": [
     "llm",
@@ -26,6 +26,9 @@
     "dist",
     "README.md",
     "README.zh-CN.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "docs/COMPATIBILITY.md",
     "LICENSE"
   ],
   "engines": {

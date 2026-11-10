@@ -26,6 +26,9 @@ export const PLACEHOLDER = /\[\[REDACTED:([a-z0-9_]{1,40}):([0-9a-f]{8})\]\]/g;
  * — where no pattern would see it again, and the client would send it back in clear next turn. So
  * these values are remembered and redacted wherever they appear.
  */
+/** First line of the `remembered` file: its format, so a later version can tell it apart. */
+export const REMEMBERED_HEADER = '# llm-redact remembered v1: HMAC-SHA256(key, `known\\0` + value) as 32 hex, a tab, the label\n';
+
 export const CONTEXTUAL_LABELS = new Set(['secret_assignment', 'aws_secret_key', 'url_password', 'bearer_token']);
 /**
  * Known values of 8+ characters are matched anywhere; shorter ones (a URL password like `s3cr3t`)
@@ -65,8 +68,7 @@ export class Vault implements Restorer {
    */
   readonly maxEntries: number;
   private readonly rememberFile: string | undefined;
-  constructor(key: Buffer, options: number | VaultOptions = {}) {
-    const o = typeof options === 'number' ? { maxEntries: options } : options;
+  constructor(key: Buffer, o: VaultOptions = {}) {
     this.key = key;
     this.maxEntries = o.maxEntries ?? 200_000;
     this.rememberFile = o.rememberFile;
@@ -152,8 +154,29 @@ export class Vault implements Restorer {
     return [...new Set([...this.known.keys(), ...this.restoredKnown.keys()])];
   }
 
+  /**
+   * While frozen (one walk over a request body), the known-value pattern stays as it was when the
+   * walk began: rebuilding it after every newly learned value made a body with thousands of new
+   * values quadratic (2,000 messages: 16 s). Values learned meanwhile are found by the walk that
+   * follows (see redactRequest), with one rebuild.
+   */
+  private frozen: { re: RegExp | undefined } | undefined;
+  freeze(): void {
+    this.frozen = { re: this.buildKnownPattern() };
+  }
+  thaw(): void {
+    this.frozen = undefined;
+  }
+  get isFrozen(): boolean {
+    return this.frozen !== undefined;
+  }
+
   /** A pattern matching every known value (longest first; short ones only as whole words), or undefined. */
   knownPattern(): RegExp | undefined {
+    return this.frozen ? this.frozen.re : this.buildKnownPattern();
+  }
+
+  private buildKnownPattern(): RegExp | undefined {
     if (!this.known.size && !this.restoredKnown.size) return undefined;
     this.knownRe ??= new RegExp(
       this.knownValues()
@@ -189,19 +212,31 @@ export class Vault implements Restorer {
     this.persisted = lines.length;
   }
 
+  /** Lines waiting to be appended: one write per request (a microtask after it), not one per value. */
+  private pendingLines: string[] = [];
+
   private persist(value: string, label: string): void {
     if (!this.rememberFile) return;
     const h = this.knownHash(value);
     this.recallable.delete(h);
+    if (!this.pendingLines.length) queueMicrotask(() => this.flushRemembered());
+    this.pendingLines.push(`${h}\t${label}\n`);
+  }
+
+  /** Append what was learned since the last flush (runs by itself right after the request that learned it). */
+  flushRemembered(): void {
+    if (!this.rememberFile || !this.pendingLines.length) return;
+    const lines = this.pendingLines;
+    this.pendingLines = [];
     try {
-      if (this.persisted === 0 && !existsSync(this.rememberFile)) writePrivate(this.rememberFile, '');
-      appendFileSync(this.rememberFile, `${h}\t${label}\n`);
-      this.persisted++;
+      if (this.persisted === 0 && !existsSync(this.rememberFile)) writePrivate(this.rememberFile, REMEMBERED_HEADER);
+      appendFileSync(this.rememberFile, lines.join(''));
+      this.persisted += lines.length;
       // Keep the file to about the memory's bound: rewrite it with the newest entries.
       if (this.persisted > 2 * MAX_KNOWN) {
         const keep = [...this.recallable.entries()].slice(-MAX_KNOWN).map(([x, l]) => `${x}\t${l}`);
         for (const [v, l] of [...this.known, ...this.restoredKnown]) keep.push(`${this.knownHash(v)}\t${l}`);
-        writePrivate(this.rememberFile, keep.slice(-MAX_KNOWN).join('\n') + '\n');
+        writePrivate(this.rememberFile, REMEMBERED_HEADER + keep.slice(-MAX_KNOWN).join('\n') + '\n');
         this.persisted = Math.min(keep.length, MAX_KNOWN);
       }
     } catch {
@@ -212,14 +247,20 @@ export class Vault implements Restorer {
   /**
    * Values remembered in an earlier run, found again in `text`: each word-like token that could be
    * a secret is hashed and compared. A match becomes a known value again. Returns whether one did.
-   * (Only while hashes are waiting to be matched — usually just the first requests after a restart.)
+   * Runs on every text not served from the cache while hashes are waiting to be matched — hashes of
+   * conversations that never come back stay waiting for the life of the process (at most 5,000).
    */
   recall(text: string): boolean {
     if (!this.recallable.size) return false;
     let found = false;
-    for (const m of text.matchAll(/[^\s'"`,;=:()<>[\]{}|]{4,400}/g)) {
+    // Split on whitespace and quotes only: a password may well hold `=` or `:`. Then try the token,
+    // the token without surrounding brackets and punctuation, and what follows its last = or :
+    // (`PGPASSWORD=x`, `--password:x`).
+    for (const m of text.matchAll(/[^\s'"`]{4,400}/g)) {
       const token = m[0];
-      for (const t of new Set([token, token.replace(/[.!?]+$/, '')])) {
+      const trimmed = token.replace(/^[([{<]+/, '').replace(/[)\]}>.,;:!?]+$/, '');
+      const after = /[=:]([^=:]{4,})$/.exec(trimmed)?.[1];
+      for (const t of new Set([token, trimmed, ...(after ? [after] : [])])) {
         if (t.length < MIN_KNOWN_SHORT || (t.length < 20 && classes(t) < 2)) continue;
         const label = this.recallable.get(this.knownHash(t));
         if (label === undefined) continue;
@@ -244,19 +285,27 @@ export class Vault implements Restorer {
    * of another conversation, a guessed tag, or a placeholder planted in a file the agent read, and a
    * value evicted from the vault while the response streams is still restored.
    */
-  scope(placeholders: Iterable<string>, extra?: Map<string, string>): Restorer & { readonly values: Map<string, string> } {
+  scope(placeholders: Iterable<string>, extra?: Map<string, string>): Restorer & { readonly values: Map<string, string>; readonly missed: number } {
     const values = new Map<string, string>(extra ?? []);
     for (const ph of placeholders) {
       const v = this.byPlaceholder.get(ph);
       if (v !== undefined) values.set(ph, v);
     }
+    let missed = 0;
     return {
       values,
+      /** Placeholders seen in the response that this scope could not restore (the log reports them). */
+      get missed() {
+        return missed;
+      },
       restore: (text, encode = (v) => v) => {
         if (!text.includes('[[REDACTED:')) return text;
         return text.replace(new RegExp(PLACEHOLDER.source, 'g'), (ph) => {
           const v = values.get(ph);
-          if (v === undefined) return ph;
+          if (v === undefined) {
+            missed++;
+            return ph;
+          }
           this.markRestored(ph, v);
           return encode(v);
         });

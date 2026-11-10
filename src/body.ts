@@ -58,6 +58,8 @@ const MIN_NUMBER_DIGITS = 7;
  * (OpenAI, OpenRouter's `reasoning.*` details). A block merely *called* thinking is not one.
  */
 export function isSigned(o: Record<string, unknown>): boolean {
+  // A Gemini part with a thought signature goes back exactly as it came.
+  if (typeof o.thoughtSignature === 'string') return true;
   const t = o.type;
   if (typeof t !== 'string') return false;
   // OpenRouter's reasoning details must go back exactly as they came, signed or not.
@@ -198,22 +200,27 @@ function walk(v: unknown, fn: Visit, key = '', mode: Mode = 'envelope', depth = 
   return out;
 }
 
+/**
+ * A value under a secret-named key (a JSON key in tool arguments or config, a form field name):
+ * redacted whole — with the label its shape says (an `sk-…` under "password" is still an openai_key).
+ */
+export function keyedSecret(key: string, value: string, vault: Vault, opts: RedactOptions = {}): Hit | undefined {
+  const off = new Set(opts.disable ?? []);
+  if (!key || off.has('secret_assignment') || off.has('secret') || (opts.allow ?? []).includes(value) || !secretByKey(key, value)) return undefined;
+  const d = canonicalDetector(value, DETECTOR_BY_ID.get('secret_assignment') as Detector, activeDetectors(opts));
+  return { detector: d.id, kind: d.kind, start: 0, end: value.length, placeholder: vault.placeholderFor(d.id, value) };
+}
+
 /** Redact a parsed request body. Adds the placeholder note when the request contains any placeholder. */
 export function redactRequest(body: unknown, vault: Vault, api: Api, opts: RedactOptions & { note?: boolean } = {}): RedactResult {
   const hits: Hit[] = [];
   let sawPlaceholder = false;
-  const off = new Set(opts.disable ?? []);
-  const allow = new Set(opts.allow ?? []);
-  const generic = DETECTOR_BY_ID.get('secret_assignment') as Detector;
   const text = (s: string, key = ''): string => {
-    // A value under a secret-named key (in tool arguments, config objects): redact it whole — with
-    // the label its shape says (an `sk-…` under "password" is still an openai_key).
-    if (key && !off.has('secret_assignment') && !off.has('secret') && !allow.has(s) && secretByKey(key, s)) {
-      const d = canonicalDetector(s, generic, activeDetectors(opts));
-      const placeholder = vault.placeholderFor(d.id, s);
-      hits.push({ detector: d.id, kind: d.kind, start: 0, end: s.length, placeholder });
+    const keyed = keyedSecret(key, s, vault, opts);
+    if (keyed) {
+      hits.push(keyed);
       sawPlaceholder = true;
-      return placeholder;
+      return keyed.placeholder;
     }
     const r = redactText(s, vault, opts);
     hits.push(...r.hits);
@@ -244,14 +251,23 @@ export function redactRequest(body: unknown, vault: Vault, api: Api, opts: Redac
   };
   const mode: Mode = api === 'other' ? 'loose' : 'envelope';
   const mark = vault.knownMark;
-  let out = walk(body, visit, '', mode);
-  // The request taught the vault a value (`DB_PASSWORD=x` in a later message): walk it once more,
-  // so the bare value in an *earlier* message is caught too — the shape of the first request after
-  // a restart. Texts seen in the first walk come from the cache, so this costs little.
-  if (vault.knownSince(mark)?.length !== 0) {
-    hits.length = 0;
-    sawPlaceholder = false;
+  // One known-value pattern per walk (see Vault.freeze): values learned during the walk do not
+  // make every later string rebuild it.
+  vault.freeze();
+  let out: unknown;
+  try {
     out = walk(body, visit, '', mode);
+    // The request taught the vault a value (`DB_PASSWORD=x` in a later message, or one recalled
+    // after a restart): walk it once more with the new pattern, so the bare value elsewhere — in an
+    // *earlier* message too — is caught. Texts seen in the first walk come from the cache.
+    if (vault.knownSince(mark)?.length !== 0) {
+      hits.length = 0;
+      sawPlaceholder = false;
+      vault.freeze();
+      out = walk(body, visit, '', mode);
+    }
+  } finally {
+    vault.thaw();
   }
   if (sawPlaceholder && opts.note !== false && isObject(out)) addNote(out, api);
   return { body: out, hits };
@@ -290,21 +306,29 @@ export function redactForm(body: string, vault: Vault, opts: RedactOptions = {})
     .split('&')
     .map((pair) => {
       const eq = pair.indexOf('=');
-      const parts = eq < 0 ? [pair] : [pair.slice(0, eq), pair.slice(eq + 1)];
-      return parts
-        .map((raw) => {
-          let plain = raw;
-          try {
-            plain = decodeURIComponent(raw.replace(/\+/g, ' '));
-          } catch {
-            // malformed escapes: redact it as it is
-          }
-          const r = redactText(plain, vault, opts);
-          if (!r.hits.length) return raw;
-          hits.push(...r.hits);
-          return encodeURIComponent(r.text);
-        })
-        .join('=');
+      const decode = (raw: string) => {
+        try {
+          return decodeURIComponent(raw.replace(/\+/g, ' '));
+        } catch {
+          return raw; // malformed escapes: redact it as it is
+        }
+      };
+      const redactPart = (raw: string, name = '') => {
+        const plain = decode(raw);
+        // A field's name is its context, as a JSON key is: `password=…`, `client_secret=…`.
+        const keyed = name ? keyedSecret(name, plain, vault, opts) : undefined;
+        if (keyed) {
+          hits.push(keyed);
+          return encodeURIComponent(keyed.placeholder);
+        }
+        const r = redactText(plain, vault, opts);
+        if (!r.hits.length) return raw;
+        hits.push(...r.hits);
+        return encodeURIComponent(r.text);
+      };
+      if (eq < 0) return redactPart(pair);
+      const name = pair.slice(0, eq);
+      return `${redactPart(name)}=${redactPart(pair.slice(eq + 1), decode(name))}`;
     })
     .join('&');
   return { text, hits };
@@ -313,11 +337,12 @@ export function redactForm(body: string, vault: Vault, opts: RedactOptions = {})
 /** JSON-string escaping for a value restored inside JSON text (tool-call arguments). */
 export const jsonEncode = (value: string): string => JSON.stringify(value).slice(1, -1);
 
-/** Restore placeholders in a parsed (non-streamed) response body — tool inputs, keys and arguments included. */
 /**
- * Never restored: thinking and reasoning, signed or not. Signed ones go back verbatim next turn (a
- * restored value would go out in clear); unsigned ones arrive as stream deltas that are not restored
- * either, and a response must read the same streamed or not.
+ * Never restored, streamed or not: signed blocks (they go back verbatim next turn — a restored value
+ * would go out in clear), and Anthropic thinking and Responses reasoning items even unsigned (their
+ * stream deltas cannot be told apart until the signature arrives at the end). Plain reasoning *text*
+ * fields — DeepSeek's `reasoning_content`, Ollama's `thinking`, unsigned Gemini thought parts — are
+ * restored like any text, streamed or not.
  */
 const isReasoning = (o: Record<string, unknown>): boolean => isSigned(o) || (typeof o.type === 'string' && SIGNED_TYPES.has(o.type));
 

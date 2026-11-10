@@ -34,13 +34,16 @@ export interface ProxyOptions {
   redact: RedactOptions & { note?: boolean };
   /** One line per request (counts only). */
   log?: (line: string) => void;
+  /** Things that weaken protection (a body forwarded unredacted): always reported, even without a log. */
+  warn?: (line: string) => void;
   /** Largest request body accepted (bytes) — also the limit for what a compressed body may inflate to. */
   maxBody?: number;
   /** Forward bodies that cannot be redacted (multipart uploads, binary) instead of refusing them. */
   allowUnredacted?: boolean;
   /**
-   * Require this secret as the first path segment (`/<token>/anthropic/…`). Anyone who can reach the
-   * proxy could otherwise get a placeholder they have seen turned back into its value.
+   * Require this secret as the first path segment (`/<token>/anthropic/…`), so that other programs on
+   * a shared machine cannot use the proxy at all. (They could not get your values restored anyway: a
+   * response restores only its own request's placeholders.)
    */
   token?: string;
 }
@@ -51,7 +54,17 @@ export interface ProxyStats {
 }
 
 const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'content-encoding', 'accept-encoding', 'expect']);
+const LOOPBACK_ORIGIN = /^https?:\/\/(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?$/i;
 const LOOPBACK_HOST = /^(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?$/i;
+
+/**
+ * An error the way both SDKs read one: Anthropic's `{ type: "error", error: { type, message } }`,
+ * which OpenAI clients read as `error.message` too. (Part of the 1.0 surface: see COMPATIBILITY.md.)
+ */
+function fail(res: ServerResponse, status: number, message: string, extra: Record<string, unknown> = {}): void {
+  const type = status === 413 ? 'request_too_large' : status === 403 ? 'permission_error' : status === 404 ? 'not_found_error' : status >= 500 ? 'api_error' : 'invalid_request_error';
+  send(res, status, { type: 'error', error: { type, message: message.startsWith('llm-redact') ? message : `llm-redact: ${message}` }, ...extra });
+}
 
 function send(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
@@ -107,6 +120,8 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
   const stats: ProxyStats = { requests: 0, redacted: {} };
   const maxBody = opts.maxBody ?? 64 * 1024 * 1024;
   const log = opts.log ?? (() => {});
+  // What weakens protection is said even when the log is off (-q).
+  const warn = opts.warn ?? ((l: string) => console.error(`llm-redact: warning: ${l}`));
   // One cache per proxy (and so per vault): repeated history is not redacted again every turn.
   const redactOpts = { ...opts.redact, cache: new RedactCache() };
   /**
@@ -121,7 +136,7 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
       // Never the URL as it came: with --require-token its first segment is the token.
       const where = opts.token ? (req.url ?? '').replace(opts.token, '<token>') : req.url;
       log(`${req.method} ${where} -> internal error: ${(err as Error)?.message ?? err}`);
-      if (!res.headersSent) send(res, 500, { error: 'llm-redact internal error' });
+      if (!res.headersSent) fail(res, 500, 'llm-redact internal error');
       else res.destroy();
     });
   });
@@ -129,26 +144,30 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const t0 = Date.now();
     // DNS rebinding: a web page that resolves its own name to 127.0.0.1 still sends its own Host.
-    if (!LOOPBACK_HOST.test(req.headers.host ?? '')) return send(res, 403, { error: 'llm-redact only accepts requests addressed to localhost' });
+    if (!LOOPBACK_HOST.test(req.headers.host ?? '')) return fail(res, 403, 'llm-redact only accepts requests addressed to localhost');
+    // A web page on another site can still POST here (a "simple" request needs no preflight). Agents
+    // and SDKs send no Origin; a local web app sends a loopback one.
+    const origin = req.headers.origin;
+    if ((origin !== undefined && !LOOPBACK_ORIGIN.test(origin)) || req.headers['sec-fetch-site'] === 'cross-site') return fail(res, 403, 'llm-redact does not accept requests from web pages of other sites');
     let url: URL;
     try {
       url = new URL(req.url ?? '/', 'http://localhost');
     } catch {
-      return send(res, 400, { error: 'bad request URL' });
+      return fail(res, 400, 'bad request URL');
     }
     let segments = url.pathname.split('/').slice(1);
     if (opts.token) {
       // Constant-time comparison: the token is a secret.
       const given = Buffer.from(segments[0] ?? '');
       const want = Buffer.from(opts.token);
-      if (given.length !== want.length || !timingSafeEqual(given, want)) return send(res, 403, { error: 'this llm-redact proxy requires its access token in the URL (see: llm-redact env)' });
+      if (given.length !== want.length || !timingSafeEqual(given, want)) return fail(res, 403, 'this llm-redact proxy requires its access token in the URL (see: llm-redact env)');
       segments = segments.slice(1);
     }
     const [name = '', ...rest] = segments;
     if (!name) return send(res, 200, { name: 'llm-redact', version: VERSION, upstreams: Object.keys(opts.upstreams), stats });
     // Own properties only: "__proto__" or "constructor" is not an upstream.
     const base = Object.hasOwn(opts.upstreams, name) ? opts.upstreams[name] : undefined;
-    if (typeof base !== 'string') return send(res, 404, { error: `unknown upstream "${name}"`, upstreams: Object.keys(opts.upstreams) });
+    if (typeof base !== 'string') return fail(res, 404, `unknown upstream "${name}"`, { upstreams: Object.keys(opts.upstreams) });
     const path = '/' + rest.join('/');
     const target = base.replace(/\/+$/, '') + path + url.search;
     const api = apiFor(path);
@@ -202,13 +221,14 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
     } catch (err) {
       const status = (err as { status?: number }).status ?? (/maxOutputLength|buffer|too large|nested deeper/i.test((err as Error).message) ? 413 : 400);
       log(`${req.method} /${name}${path} -> refused (${status}): ${(err as Error).message}`);
-      return send(res, status, { error: (err as Error).message });
+      return fail(res, status, (err as Error).message);
     }
     for (const [k, n] of Object.entries(counts)) stats.redacted[k] = (stats.redacted[k] ?? 0) + n;
     // Restores only this request's placeholders, with their values pinned now: no guessed tag, no
     // placeholder planted in a file the agent read, no other conversation's value — and an eviction
     // from the vault while the response streams cannot take a value away from it.
-    const scope = opts.vault.scope(produced, previous ? scopes.get(previous) : undefined);
+    // (Keyed by upstream and id: an id from one provider means nothing for another.)
+    const scope = opts.vault.scope(produced, previous ? scopes.get(`${name}\0${previous}`) : undefined);
 
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k.toLowerCase()) && v !== undefined) headers[k] = Array.isArray(v) ? v.join(', ') : v;
@@ -224,7 +244,7 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
       upstream = await fetch(target, { method: req.method, headers, body: body && body.length ? new Uint8Array(body) : undefined, redirect: 'manual', signal: abort.signal });
     } catch (err) {
       log(`${req.method} /${name}${path} -> upstream error: ${(err as Error).message}`);
-      return send(res, 502, { error: `upstream ${base} unreachable: ${(err as Error).message}` });
+      return fail(res, 502, `upstream ${base} unreachable: ${(err as Error).message}`);
     }
 
     const outHeaders: Record<string, string | string[]> = {};
@@ -248,7 +268,7 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
       } else {
         await upstream.body?.cancel();
         log(`${req.method} /${name}${path} -> refused redirect to ${loc.origin}`);
-        return send(res, 502, { error: `upstream redirected to ${loc.origin}; llm-redact does not let clients follow redirects past it` });
+        return fail(res, 502, `upstream redirected to ${loc.origin}; llm-redact does not let clients follow redirects past it`);
       }
     }
     const type = upstream.headers.get('content-type') ?? '';
@@ -314,16 +334,19 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
       }
     } catch (err) {
       outcome = `response refused: ${(err as Error).message}`;
-      if (!res.headersSent) send(res, 502, { error: (err as Error).message });
+      if (!res.headersSent) fail(res, 502, (err as Error).message);
       else res.destroy(err as Error);
     }
     // A later request may continue this response (Responses API): keep what it could restore.
     if (api === 'responses' && responseId && scope.values.size) {
-      scopes.set(responseId, scope.values);
+      scopes.set(`${name}\0${responseId}`, scope.values);
       if (scopes.size > 1000) scopes.delete(scopes.keys().next().value as string);
     }
     const summary = Object.entries(counts).map(([k, n]) => `${k} x${n}`).join(' ');
-    log(`${req.method} /${name}${path} -> ${outcome ?? upstream.status} ${Date.now() - t0}ms${summary ? `  redacted ${summary}` : ''}${note}`);
+    // Placeholders the response held that its request did not carry: written as they are, so say so.
+    const unrestored = scope.missed ? `  unrestored ${scope.missed}` : '';
+    log(`${req.method} /${name}${path} -> ${outcome ?? upstream.status} ${Date.now() - t0}ms${summary ? `  redacted ${summary}` : ''}${unrestored}${note}`);
+    if (note) warn(`${req.method} /${name}${path}${note}`);
   }
   // Agents are idle between turns. Node closes idle connections after 5 s by default, and a client
   // reusing one at that moment gets ECONNRESET on a POST it will not retry. Clients' own idle

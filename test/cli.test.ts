@@ -105,7 +105,7 @@ describe('private files (key, token)', () => {
 
 describe('vault memory', () => {
   it('is bounded, least recently used out first; a value seen again gets its placeholder back', () => {
-    const v = new Vault(Buffer.alloc(32, 3), 100);
+    const v = new Vault(Buffer.alloc(32, 3), { maxEntries: 100 });
     const first = v.placeholderFor('email', 'keep@corp-mail.cn');
     for (let i = 0; i < 1000; i++) {
       v.placeholderFor('email', `u${i}@corp-mail.cn`);
@@ -137,7 +137,7 @@ describe('redaction cache', () => {
     assert.notEqual(redactText(long(2), v, { cache }).hits[0]!.placeholder, 'tampered');
   });
   it('a hit puts its values back into a vault that had forgotten them', () => {
-    const small = new Vault(Buffer.alloc(32, 2), 3);
+    const small = new Vault(Buffer.alloc(32, 2), { maxEntries: 3 });
     const cache = new RedactCache();
     const first = redactText(long(7), small, { cache });
     const ph = first.hits.find((h) => h.detector === 'openai_key')!.placeholder;

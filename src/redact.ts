@@ -7,8 +7,9 @@
  * Detectors run in order; where matches overlap, the earlier detector wins (a private-key block
  * beats the tokens inside it; a provider token beats the generic NAME=value rule).
  *
- * Text is also searched one or two encoding levels down — JSON escapes (`\"`, `&`), HTML
- * entities (`&quot;`), CSV-doubled quotes — because tool results quote logs, configs and API
+ * Text is also searched one or two encoding levels down — JSON escapes (`\"`, `\u0026`), HTML
+ * entities (`&quot;`), percent-encoding, CSV-doubled quotes, shell and Python quoting, and base64
+ * tokens (replaced whole) — because tool results quote logs, configs and API
  * responses. Every decoded view keeps a map back to the original offsets, so a value found there
  * is replaced exactly where it is, however the serializer happened to spell it.
  */
@@ -78,7 +79,14 @@ export class RedactCache {
 
   set(text: string, r: Cached): void {
     const cost = text.length + r.text.length;
-    if (cost > this.maxChars / 4 || this.map.has(text)) return;
+    if (cost > this.maxChars / 4) return;
+    // A newer result replaces an older one (a request's second walk redoes what its first walk
+    // did with an older pattern — kept, the stale entry would be redone on every later request).
+    const old = this.map.get(text);
+    if (old) {
+      this.map.delete(text);
+      this.size -= text.length + old.text.length;
+    }
     this.map.set(text, r);
     this.size += cost;
     for (const [k, v] of this.map) {
@@ -151,7 +159,7 @@ function mergeSpans(a: Span[], b: Span[]): Span[] {
 const SHAPE_DETECTORS = new Map<string, RegExp>();
 /**
  * The most specific label for a value: an `sk-proj-…` under a JSON key "password" is still an
- * openai_key. Labels must depend on the value alone, or the same secret gets a different placeholder
+ * openai_key. Labels should depend on the value, not on where it was found, or the same secret gets a different placeholder
  * after a restart (and the prompt cache misses). (In text this holds by detector order: the shape
  * detectors run before the generic NAME=value rule.)
  */
@@ -266,7 +274,7 @@ function decodeView(v: View, d: (typeof DECODERS)[number]): View | undefined {
   return { text: parts.join(''), map: map.slice(0, n + 1) };
 }
 
-/** The decoded views worth searching: JSON one and two levels down, HTML entities (and JSON inside them), percent-encoding, CSV quotes. */
+/** The decoded views worth searching: JSON one and two levels down, HTML entities (and JSON inside them), percent-encoding, CSV quotes, shell quoting. */
 function viewsOf(text: string): View[] {
   if (!DECODERS.some((d) => d.test.test(text))) return [];
   const identity = new Int32Array(text.length + 1);
@@ -306,7 +314,8 @@ export function redactText(text: string, vault: Vault, opts: RedactOptions = {})
   let r = redactUncached(text, vault, opts);
   // This text taught the vault a value (`DB_PASSWORD=x` … `psql -W x`): once more, so the value is
   // also found where only the known-value pass can see it. (A second round learns nothing new.)
-  if (vault.knownSince(mark)?.length !== 0) {
+  // (Inside a request walk the pattern is frozen: the walk over the whole body that follows does this.)
+  if (!vault.isFrozen && vault.knownSince(mark)?.length !== 0) {
     mark = vault.knownMark;
     r = redactUncached(text, vault, opts);
   }

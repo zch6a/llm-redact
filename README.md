@@ -10,7 +10,7 @@ before your agent reads the reply — in text, in tool calls, in streamed respon
 
 Claude Code · Codex · OpenCode · DeepSeek · any OpenAI- or Anthropic-compatible client
 
-Local · Zero dependencies · Nothing stored but a random key
+Local · Zero dependencies · No value ever written to disk
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
@@ -93,12 +93,12 @@ Measured, not assumed: over 2,955 real files (five popular public skill reposito
 - **Base64 is looked into.** `curl -v` prints `Authorization: Basic …` with your restored password inside; a token whose decoded text holds a secret is replaced whole.
 - **Streaming.** A placeholder can be split across any number of streamed deltas (`[[RED` + `ACTED:op…`). The restorer holds back only a tail that could still become a placeholder — ordinary text is not delayed — and tool-call arguments stay valid JSON even when the restored value contains quotes or backslashes.
 - **Encoded text is searched too.** Tool results quote logs, configs and API responses, so text is also searched one and two levels down — JSON escapes in any spelling (`\"`, Go's `\u0026`, .NET's `\u002B`, Python's `\u00e4`), HTML entities, percent-encoding, CSV-doubled quotes, shell and Python quoting (`'\''`, `\'`) — and a value found there is replaced exactly where it sits. Card and phone numbers written as JSON numbers are found; other numbers are kept exactly as written (`12345678901234567890`, `1.10`). Placeholders already in a request (the model's own earlier output) are never redacted again.
-- **Signed blocks are left alone.** Anthropic thinking blocks with their signature and OpenAI / OpenRouter encrypted reasoning (summaries included) are verified byte for byte by the provider; they are never modified in either direction. Unsigned reasoning (DeepSeek's `reasoning_content`) is ordinary text.
-- **The model is told.** When a request contains placeholders, one sentence is appended to the end of the system prompt explaining them (so it writes them verbatim instead of asking for the key). Appending at the end keeps cached prefixes intact. `--no-note` turns it off.
+- **Signed blocks are left alone.** Anthropic thinking blocks, OpenAI reasoning items (summaries included), OpenRouter reasoning details and Gemini parts with a thought signature are verified byte for byte by the provider (or must go back as they came); they are never modified in either direction, streamed or not. Plain reasoning *text* — DeepSeek's `reasoning_content`, Ollama's `thinking`, unsigned Gemini thoughts — is ordinary text, redacted and restored like any other.
+- **The model is told.** When a request in a format it knows (Anthropic, Chat Completions, Responses) contains placeholders, one sentence is appended to the end of the system prompt explaining them (so it writes them verbatim instead of asking for the key). Appending at the end keeps cached prefixes intact. `--no-note` turns it off. Other formats (Ollama, Gemini) get no note: there is no system prompt llm-redact knows how to extend.
 
 - **Fails closed.** A body it cannot redact is refused, never forwarded as it came: invalid JSON → 400; absurd nesting, a compressed body that inflates past the limit, or more than a million values in one text → 413; an upload, other binary body, or text in a charset other than UTF-8 → 415 (start with `--allow-unredacted` to forward those as they are; the log marks each one). Plain-text bodies are redacted as text, form bodies field by field. A redirect to anywhere but the same upstream is refused, because the client would re-send its original, unredacted body there.
 
-Supported wire formats: Anthropic Messages (also through Vertex AI's `:streamRawPredict`), OpenAI Chat Completions, OpenAI Responses — streamed and not, including tool inputs, tool results, earlier tool-call arguments, Predicted Outputs and Codex's custom tools; text files sent as base64. Any other JSON API (Ollama, Gemini, …) is redacted generically — every string and object key — and its responses are restored: Gemini and legacy-completions streams, newline-delimited JSON streams (Ollama), and server-sent events on paths it does not know. Responses keep everything a direct connection would give — numbers exactly as written, every `Set-Cookie`, event ids and sequence numbers (an inserted event for held-back text gets the next number; later ones move up), and a stream that ends without its usual terminator still delivers every character. A response is limited to the request body limit (64 MB by default): an upstream that never stops is cut off, not buffered.
+Supported wire formats: Anthropic Messages (also through Vertex AI's `:streamRawPredict`), OpenAI Chat Completions, OpenAI Responses — streamed and not, including tool inputs, tool results, earlier tool-call arguments, Predicted Outputs and Codex's custom tools; text files sent as base64. Any other JSON API (Ollama, Gemini, …) is redacted generically — every string and object key — and its responses are restored: Gemini and legacy-completions streams, newline-delimited JSON streams (Ollama), and server-sent events on paths it does not know. Responses keep everything a direct connection would give — numbers exactly as written, every `Set-Cookie`, event ids and sequence numbers (an inserted event for held-back text gets the next number; later ones move up), and a stream that ends without its usual terminator still delivers every character. Sizes are bounded by `--max-body` (64 MB by default): a request body, a non-streamed response body, and each single event or line of a streamed one (a stream as a whole may run as long as it likes) — an upstream that never stops an event is cut off, not buffered.
 
 Left as they are, on purpose: **tool definitions and output schemas** (written by the client, like its code, and kept byte-stable for the prompt cache), request settings (`stop`, `safety_identifier`, `mcp_servers`), signed blocks, and binary files (images, PDFs).
 
@@ -113,9 +113,23 @@ Left as they are, on purpose: **tool definitions and output schemas** (written b
 | `llm-redact detectors` | List detectors |
 | `llm-redact stats` | What a running proxy has redacted so far (counts only) |
 
-Options: `--upstream name=url` (repeatable) · `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--require-token` · `--allow-unredacted` · `--config file` · `-q`. A config file (`config.json` next to the key) takes the same settings: `{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [], "requireToken": false, "allowUnredacted": false }`.
+Options: `--upstream name=url` (repeatable) · `--disable ids` · `--enable ids` · `--allow value` · `--no-note` · `--require-token` · `--allow-unredacted` · `--max-body MB` · `--config file` · `-q`. A config file (`config.json` next to the key) takes the same settings: `{ "port": 8787, "upstreams": {}, "disable": [], "enable": [], "allow": [], "note": true, "requireToken": false, "allowUnredacted": false, "maxBody": 64 }`. A broken file, a setting of the wrong type or a near-miss name (`requireTokn`) is an error; an unknown name is a warning (a setting of a newer version). The files live in `~/.config/llm-redact` (`%APPDATA%\llm-redact` on Windows), or in `$LLM_REDACT_HOME` if that is set.
 
-The request log shows counts only — `POST /anthropic/v1/messages -> 200 1834ms  redacted openai_key x1 email x2` — never bodies or values.
+Settings that weaken protection — `--allow-unredacted`, turned-off detectors, `--allow` values, and an `HTTPS_PROXY` it cannot use — are printed as warnings at every start, and every body forwarded unredacted is reported on stderr, also with `-q`.
+
+The request log shows counts only — `POST /anthropic/v1/messages -> 200 1834ms  redacted openai_key x1 email x2` — never bodies or values. `unrestored 2` at the end of a line means the response held placeholders its request did not carry; they reached the client as they are (see Restarts below).
+
+Errors from llm-redact itself have the shape both SDKs read, `{ "type": "error", "error": { "type": "invalid_request_error", "message": "llm-redact: …" } }`, with the status saying what happened: 400 not JSON, 403 not allowed, 413 too large or too deep, 415 cannot be redacted, 502 the upstream could not be reached or answered badly.
+
+## Performance
+
+Redaction runs in the proxy's single thread, so a request being redacted delays the others for that long. A new 2 MB request takes about 140 ms (about 420 ms while 5,000 values remembered from before a restart are still waiting to be matched); everything an agent sends again next turn comes from a cache, so a 1 MB request of a running session costs a few milliseconds. Measured with `npm run soak` (four agents, hundreds of turns: flat latency, ~60 MB of live memory).
+
+## Restarts and upgrades
+
+- The key and the `remembered` hashes survive a restart: placeholders stay the same, so prompt caches keep hitting, and remembered values are recognised again.
+- The cache, the in-memory values and the per-response scopes do not. Values come back with the next request that carries them. A Responses API conversation continued with `previous_response_id` across a restart — or one that keeps its history on the server (`conversation`) — gets placeholders it can no longer restore: they are passed through as they are and counted (`unrestored`) in the log.
+- A new version that detects more (or less) changes the placeholders of the values concerned: one prompt-cache miss.
 
 ## Security
 
@@ -131,9 +145,15 @@ The request log shows counts only — `POST /anthropic/v1/messages -> 200 1834ms
 - **Uploads and binary files are not redacted.** Bodies sent as `multipart/form-data` are refused unless you pass `--allow-unredacted`, in which case they go out as they are. Images and PDFs inside a request are passed through (text files sent as base64 are redacted).
 - **Tool definitions are not redacted.** A key pasted into an MCP server's tool description goes out with it.
 - **Responses typed `application/json` are read whole** before they are restored (a stream mislabelled that way arrives at once at the end).
+- **Not supported:** WebSocket transports (a client that talks to the provider over a WebSocket does not go through the proxy's redaction). llm-redact connects to the upstream **directly**: Node's `fetch` does not use `HTTPS_PROXY`, so if the provider is only reachable through an HTTP proxy, requests fail (502). A non-streamed request that takes more than 5 minutes before the provider answers is cut off by Node's `fetch` — stream long requests.
+- **Tokens made only of letters** can look like identifiers (`ForgotPassword`), which the generic `NAME=value` rule must not take for secrets: a random letters-only token is missed about one time in 13. A random token of 20+ characters almost always has a digit or a symbol, so overall about 1 random base64 token in 1,500 is missed; provider keys (`sk-…`, `ghp_…`, …) are found by their shape whatever they contain.
 - **Only what goes through the proxy.** Tools the agent runs itself (a web fetch, a `curl`) are outside it.
 - **Placeholders are restored on your side — for whatever wrote them.** That is the design: the model writes `[[REDACTED:…]]` into a command or file and the real value lands on your machine. It also means an agent that has been prompt-injected (by a web page, a README, a tool result) can still be steered into using a restored secret — say, a `curl` that sends it somewhere. llm-redact keeps values away from the *provider*; it does not make an agent safe to run with secrets in reach.
 - The model sees placeholders, so it cannot reason about the *content* of a secret (e.g. "is this key for staging or production?"). That is the point.
+
+## Compatibility
+
+From 1.0, placeholders, labels, files on disk, config keys, flags, exit codes, JSON outputs and error responses are stable within 1.x — see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for exactly what is promised and what (what is detected, the log line) may improve in a minor release.
 
 ## Requirements
 

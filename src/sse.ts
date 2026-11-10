@@ -399,8 +399,9 @@ export class SseRestorer {
       if (content && Array.isArray(content.parts)) {
         content.parts = content.parts.map((part, pi) => {
           if (!isObj(part)) return part;
-          // Thought summaries are reasoning: left alone, like everywhere else.
-          if (part.thought === true) return part;
+          // A part with a thought signature goes back as it came; unsigned thought text is restored
+          // like any text (as it is when not streamed).
+          if (typeof part.thoughtSignature === 'string') return part;
           if (typeof part.text === 'string') return { ...part, text: this.restorer(`m:${ci}:${pi}`, false).push(part.text) };
           return this.restore(part); // function calls and the like come whole
         });
