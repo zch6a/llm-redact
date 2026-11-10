@@ -61,6 +61,26 @@ describe('detectors: recall', () => {
     assert.deepEqual(r.hits.map((h) => h.detector), ['private_key']);
     assert.match(r.text, /^key:\n\[\[REDACTED:private_key:[0-9a-f]{8}\]\]\nend$/);
   });
+  it('values with quotes and escapes are redacted whole (a partial match would leak the rest)', () => {
+    const cases: [string, string][] = [
+      ['DB_PASSWORD=P"a\\ss-W0rd-9xQz', 'W0rd-9xQz'], // unquoted .env value containing a quote
+      ['{"password": "abc\\"Def9xQz12"}', 'Def9xQz12'], // JSON text with an escaped quote
+      ["api_key: 'Zq8-mW3pL7vT2k'", 'Zq8-mW3pL7vT2k'],
+    ];
+    for (const [text, rest] of cases) {
+      const r = redact(text);
+      assert.ok(!r.text.includes(rest), `${text} → ${r.text}`);
+    }
+    assert.match(redact('password: Tr0ub4dor&3xK9, next').text, /: \[\[REDACTED:secret_assignment:[0-9a-f]{8}\]\], next$/, 'trailing punctuation stays outside');
+  });
+  it('a value under a secret-named key in structured data', async () => {
+    const { secretByKey } = await import('../src/detectors.ts');
+    assert.ok(secretByKey('pw', 'P"a\\ss-W0rd-9xQz'));
+    assert.ok(secretByKey('clientSecret', 'Zq8mW3pL7vT2kXr4'));
+    assert.ok(!secretByKey('pw', 'changeme'));
+    assert.ok(!secretByKey('token_count', '128000'));
+    assert.ok(!secretByKey('name', 'Zq8mW3pL7vT2kXr4'));
+  });
   it('keeps the name, replaces only the value', () => {
     assert.match(redact('DB_PASSWORD=Tr0ub4dor&3xK9').text, /^DB_PASSWORD=\[\[REDACTED:secret_assignment:[0-9a-f]{8}\]\]$/);
     assert.match(redact('postgres://app:Xq7-mZ2pL9vT@db:5432/x').text, /^postgres:\/\/app:\[\[REDACTED:url_password:[0-9a-f]{8}\]\]@db:5432\/x$/);

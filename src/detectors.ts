@@ -19,8 +19,8 @@ export interface Detector {
   kind: Kind;
   description: string;
   re: RegExp;
-  /** Capture group holding the value (0 = whole match). */
-  group?: number;
+  /** Capture group holding the value (0 = whole match); with a list, the first group that matched. */
+  group?: number | number[];
   validate?: (value: string, match: RegExpExecArray) => boolean;
   /** Off unless enabled explicitly (too noisy for most code). */
   optional?: boolean;
@@ -127,8 +127,10 @@ export const DETECTORS: Detector[] = [
     id: 'secret_assignment',
     kind: 'secret',
     description: 'Value assigned to a name like *_SECRET, *_TOKEN, *PASSWORD, *_API_KEY',
-    re: /\b([A-Za-z0-9_.-]{0,40}(?:secret|token|passwd|password|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}["'`]?([^\s"'`,;)<>\]}]{8,400})/gi,
-    group: 2,
+    // The value: quoted (to the closing quote, honouring backslash escapes, so `"a\"b"` is one value)
+    // or unquoted (to whitespace: quotes *inside* an unquoted .env value are part of it).
+    re: /\b([A-Za-z0-9_.-]{0,40}(?:secret|token|passwd|password|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}(?:"((?:[^"\\\n]|\\.){8,400})"|'((?:[^'\\\n]|\\.){8,400})'|`([^`\n]{8,400})`|([^\s"'`<>({\[][^\s]{7,399}?)(?=[,;)}\]]*(?:\s|$)))/gi,
+    group: [2, 3, 4, 5],
     validate: (v, m) => looksReal(v) && !/^(true|false|null|none|undefined)$/i.test(v) && !/\(\)$/.test(v) && !/^(process\.env|os\.environ|env\.|config\.|settings\.|self\.|this\.|args\.|options\.|params\.)/i.test(v) && !/(type|length|count|name|file|path|url|header|field|id|limit|ttl|expir\w*)$/i.test((m[1] as string).replace(/s$/, '')),
   },
 
@@ -147,3 +149,14 @@ export const DETECTORS: Detector[] = [
 ];
 
 export const DETECTOR_BY_ID = new Map(DETECTORS.map((d) => [d.id, d]));
+
+/** A JSON key / field name that says its value is a secret (`password`, `pw`, `api_key`, `clientSecret`). */
+const SECRET_KEY = /^(?:[A-Za-z0-9_.-]{0,40}[_.-])?(?:secret|token|passwd|password|pwd|pw|pass|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credentials?)s?$|(?:Secret|Token|Password|ApiKey|AccessKey|PrivateKey)$/i;
+
+/**
+ * In structured data the key is the context the NAME=value rule would see in text: a string under
+ * a secret-named key is a secret if it looks generated (`{"pw": "P\"a\\ss-W0rd-9xQ"}`).
+ */
+export function secretByKey(key: string, value: string): boolean {
+  return SECRET_KEY.test(key) && value.length >= 8 && value.length <= 400 && !/\s/.test(value) && looksReal(value) && !/^\[\[REDACTED:/.test(value);
+}

@@ -47,9 +47,12 @@ export function findValues(text: string, detectors: Detector[], allow: Set<strin
         d.re.lastIndex++;
         continue;
       }
-      const value = d.group ? m[d.group] : m[0];
+      const groups = d.group === undefined ? [0] : Array.isArray(d.group) ? d.group : [d.group];
+      const g = groups.find((i) => m![i] !== undefined) ?? 0;
+      const value = m[g];
       if (!value) continue;
-      const start = m.index + (d.group ? m[0].indexOf(value) : 0);
+      // The value's offset: after the part of the match that precedes it (the name and the `=`).
+      const start = m.index + (g ? m[0].lastIndexOf(value) : 0);
       const end = start + value.length;
       if (allow.has(value) || overlaps(m.index, m.index + m[0].length)) continue;
       if (d.validate && !d.validate(value, m)) continue;
