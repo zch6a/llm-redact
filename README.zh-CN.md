@@ -41,7 +41,7 @@ Please add these to my deployment config and check the database connects:
 
 OPENAI_API_KEY=[[REDACTED:openai_key:a3aec50a]]
 DATABASE_URL=postgres://app:[[REDACTED:url_password:1e808a61]]@db.internal:5432/prod
-STRIPE_SECRET=[[REDACTED:stripe_key:f1350c3c]]
+SESSION_TOKEN=[[REDACTED:jwt:e8ee0e1e]]
 MAX_TOKENS=4096
 LOG_LEVEL=info
 
