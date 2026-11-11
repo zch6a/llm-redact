@@ -940,7 +940,13 @@ describe('round 4: config and key files', () => {
       execFileSync('icacls', [f, '/grant', '*S-1-5-32-545:R'], { stdio: 'ignore' }); // BUILTIN\Users, explicitly
       assert.equal(writePrivate(f, 'new\n'), true);
       const acl = execFileSync('icacls', [f], { encoding: 'utf8' });
-      assert.equal(acl.split(/\r?\n/).filter((l) => /:\(/.test(l)).length, 1, acl);
+      // Only this account, apart from SYSTEM and Administrators, which can read every file on the
+      // machine anyway (GitHub's Windows runners give new files explicit entries for both).
+      const me = execFileSync('whoami', { encoding: 'utf8' }).trim().toLowerCase();
+      const entries = acl.replace(f, '').split(/\r?\n/).filter((l) => /:\(/.test(l)).map((l) => l.trim().toLowerCase());
+      const others = entries.filter((l) => !l.startsWith(me + ':') && !l.startsWith('nt authority\\system:') && !l.startsWith('builtin\\administrators:'));
+      assert.deepEqual(others, [], acl);
+      assert.ok(entries.some((l) => l.startsWith(me + ':')), acl);
       assert.equal(readFileSync(f, 'utf8'), 'new\n');
     } finally {
       rmSync(d, { recursive: true, force: true });
@@ -956,16 +962,31 @@ describe('round 5: fast paths keep their promises', () => {
 });
 describe('round 5: the fifth review', () => {
   it('#1 thousands of new values in one request do not stall the proxy', () => {
-    const w = new Vault(Buffer.alloc(32, 61));
+    // The bug was quadratic (a new regex per new value), so the test checks how the time grows: four
+    // times the input must take well under 16 times as long. A fixed limit in seconds failed on a slow
+    // shared CI runner (macOS) while the code was fine.
     const tok = (i: number) => `t${i}Ab3dEf6hIj9kLm2nOp5qRs8`;
-    let t0 = Date.now();
-    redactRequest({ model: 'm', messages: Array.from({ length: 2000 }, (_, i) => ({ role: 'user', content: `Authorization: Bearer ${tok(i)}` })) }, w, 'anthropic');
-    assert.ok(Date.now() - t0 < 2000, `2,000 messages: ${Date.now() - t0} ms (was 16 s)`);
-    t0 = Date.now();
-    const input = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [`k${i}_token`, `u${i}Ab3dEf6hIj9kLm2nOp5qRs8`]));
-    const out = JSON.stringify(redactRequest({ model: 'm', messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'n', input }] }] }, w, 'anthropic').body);
-    assert.ok(Date.now() - t0 < 2000, `1,000 fields: ${Date.now() - t0} ms (was 3.5 s)`);
-    noLeak(out, 'u999Ab3dEf6hIj9kLm2nOp5qRs8');
+    const messages = (n: number) => {
+      const w = new Vault(Buffer.alloc(32, 61));
+      const t0 = performance.now();
+      redactRequest({ model: 'm', messages: Array.from({ length: n }, (_, i) => ({ role: 'user', content: `Authorization: Bearer ${tok(i)}` })) }, w, 'anthropic');
+      return performance.now() - t0;
+    };
+    const fields = (n: number) => {
+      const w = new Vault(Buffer.alloc(32, 61));
+      const input = Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}_token`, `u${i}Ab3dEf6hIj9kLm2nOp5qRs8`]));
+      const t0 = performance.now();
+      const out = JSON.stringify(redactRequest({ model: 'm', messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'n', input }] }] }, w, 'anthropic').body);
+      noLeak(out, `u${n - 1}Ab3dEf6hIj9kLm2nOp5qRs8`);
+      return performance.now() - t0;
+    };
+    for (const [name, run, n] of [['messages', messages, 2000], ['fields', fields, 1000]] as const) {
+      run(n / 4); // warm up
+      const small = Math.min(run(n / 4), run(n / 4));
+      const large = run(n);
+      assert.ok(large < 8 * Math.max(small, 5), `${n} ${name}: ${large.toFixed(0)} ms, ${n / 4}: ${small.toFixed(0)} ms (quadratic would be 16x)`);
+      assert.ok(large < 20_000, `${n} ${name}: ${large.toFixed(0)} ms`);
+    }
   });
   it('#2 random tokens are caught (base64url, any first character); flags and identifiers are not', () => {
     let seed = 7;
