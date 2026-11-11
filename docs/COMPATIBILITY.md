@@ -20,7 +20,7 @@ From 1.0.0, llm-redact follows [Semantic Versioning](https://semver.org/). This 
 
 ## Not frozen (can change in a minor release)
 
-- **What is found.** New detectors, better patterns, fewer false positives, more recall. A minor update can redact a value the previous version left — or leave one it redacted. Either changes that value's placeholder, which costs one prompt-cache miss; restoring keeps working because the client sends the value again. If you need identical requests across machines, pin the version (`npx llm-redact@1.2.3`).
+- **What is found.** New detectors, better patterns, fewer false positives, more recall. A minor update can redact a value the previous version left — or leave one it redacted. Either changes that value's placeholder, which costs one prompt-cache miss; restoring keeps working because the client sends the value again. If you need identical requests across machines, pin the version (`npx github:zch6a/llm-redact#v1.2.3`).
 - **Which encodings are looked into** (JSON escapes, HTML, percent, CSV, shell quoting, base64 — more may be added) and **which API fields** are walked as data or left alone, as providers add fields.
 - **The request log line.** It is for people: `METHOD /upstream/path -> status time  redacted label xN …  unrestored N`; fields may be added. Counts only, never values — that part is a promise.
 - **Terminal output** of `scan`, `env` comments, warnings and the startup banner. Parse the JSON outputs instead. (The variable assignments `env` prints are stable.)

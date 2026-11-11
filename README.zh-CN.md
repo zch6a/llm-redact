@@ -1,8 +1,16 @@
 <div align="center">
 
-# 🫥 llm-redact
+<img src="assets/banner.zh-CN.svg" alt="llm-redact — Agent 照样把真实的 key 写进 `.env`，模型服务商却从来看不到它。" width="100%">
 
-**Agent 照样把真实的 key 写进 `.env`，模型服务商却从来看不到它。**
+<p>
+<a href="https://github.com/zch6a/llm-redact/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zch6a/llm-redact/actions/workflows/ci.yml/badge.svg"></a>
+<img alt="Node 22.15" src="https://img.shields.io/badge/node-%E2%89%A522.15-339933?logo=nodedotjs&logoColor=white">
+<img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-0-2ea44f">
+<img alt="OpenAI and Anthropic APIs" src="https://img.shields.io/badge/APIs-OpenAI%20%7C%20Anthropic-8a63d2">
+<a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
+[English](README.md) · **简体中文**
 
 一个跑在本机的代理，位于你的 AI 编程 Agent 和模型 API 之间。请求离开电脑之前，API key、token、私钥和个人信息会被换成占位符；回复回来、Agent 读到之前，再换回真实值——文本、工具调用、流式输出都一样。
 
@@ -10,10 +18,8 @@ Claude Code · Codex · OpenCode · DeepSeek · 任何兼容 OpenAI 或 Anthropi
 
 本地运行 · 零依赖 · 真实值从不写入磁盘
 
-[English](README.md) · [简体中文](README.zh-CN.md)
-
 ```bash
-npx llm-redact
+npx github:zch6a/llm-redact
 ```
 
 </div>
@@ -49,8 +55,8 @@ If it fails, email [[REDACTED:email:c58c2eab]] or call [[REDACTED:cn_mobile:6025
 ## 快速开始
 
 ```bash
-npx llm-redact          # 监听 http://127.0.0.1:8787
-npx llm-redact env      # 按你的 shell 打印每个客户端要设置什么
+npx github:zch6a/llm-redact          # 监听 http://127.0.0.1:8787
+npx github:zch6a/llm-redact env      # 按你的 shell 打印每个客户端要设置什么
 ```
 
 然后把 Agent 指向它：

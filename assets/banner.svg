@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 400" width="1280" height="400" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Helvetica, Arial, sans-serif" role="img" aria-label="llm-redact — Your agent keeps the real key. The model never sees it.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1d1830"/><stop offset="1" stop-color="#2e1d46"/></linearGradient>
+    <radialGradient id="glow" cx="0.16" cy="0.45" r="0.35"><stop offset="0" stop-color="#b48cff" stop-opacity=".28"/><stop offset="1" stop-color="#b48cff" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#ffffff" stroke-opacity=".045"/></pattern>
+  </defs>
+  <rect width="1280" height="400" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="400" rx="24" fill="url(#grid)"/>
+  <rect width="1280" height="400" rx="24" fill="url(#glow)"/>
+  <g transform="translate(180,190)"><rect x="-62" y="-44" width="124" height="16" rx="4" fill="#b48cff" opacity=".35"/><rect x="-62" y="-16" width="44" height="16" rx="4" fill="#b48cff" opacity=".35"/><rect x="-12" y="-16" width="74" height="16" rx="4" fill="#b48cff"/><rect x="-62" y="12" width="96" height="16" rx="4" fill="#b48cff"/><rect x="40" y="12" width="22" height="16" rx="4" fill="#b48cff" opacity=".35"/><rect x="-62" y="40" width="70" height="16" rx="4" fill="#b48cff" opacity=".35"/></g>
+  <text x="330" y="138" font-size="64" font-weight="800" fill="#ffffff" letter-spacing="-1">llm-redact</text>
+  <text x="330" y="196" font-size="30" font-weight="600" fill="#b48cff">Your agent keeps the real key. The model never sees it.</text>
+  <text x="330" y="244" font-size="20" fill="#c4c9d6">A local proxy that swaps secrets and personal data for placeholders — and puts them back</text>
+  <text x="330" y="272" font-size="20" fill="#c4c9d6">in the reply.</text>
+  <g transform="translate(330,318)"><rect width="114" height="36" rx="18" fill="#b48cff" fill-opacity=".14" stroke="#b48cff" stroke-opacity=".55"/><text x="57" y="24" text-anchor="middle" font-size="16" fill="#e8ebf2">Streaming</text></g>
+  <g transform="translate(456,318)"><rect width="124" height="36" rx="18" fill="#b48cff" fill-opacity=".14" stroke="#b48cff" stroke-opacity=".55"/><text x="62" y="24" text-anchor="middle" font-size="16" fill="#e8ebf2">Tool calls</text></g>
+  <g transform="translate(592,318)"><rect width="249" height="36" rx="18" fill="#b48cff" fill-opacity=".14" stroke="#b48cff" stroke-opacity=".55"/><text x="124" y="24" text-anchor="middle" font-size="16" fill="#e8ebf2">OpenAI &amp; Anthropic APIs</text></g>
+  <g transform="translate(853,318)"><rect width="191" height="36" rx="18" fill="#b48cff" fill-opacity=".14" stroke="#b48cff" stroke-opacity=".55"/><text x="96" y="24" text-anchor="middle" font-size="16" fill="#e8ebf2">Zero dependencies</text></g>
+</svg>

@@ -1,8 +1,16 @@
 <div align="center">
 
-# 🫥 llm-redact
+<img src="assets/banner.svg" alt="llm-redact — Your agent still writes the real key into `.env`. The model provider never sees it." width="100%">
 
-**Your agent still writes the real key into `.env`. The model provider never sees it.**
+<p>
+<a href="https://github.com/zch6a/llm-redact/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zch6a/llm-redact/actions/workflows/ci.yml/badge.svg"></a>
+<img alt="Node 22.15" src="https://img.shields.io/badge/node-%E2%89%A522.15-339933?logo=nodedotjs&logoColor=white">
+<img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-0-2ea44f">
+<img alt="OpenAI and Anthropic APIs" src="https://img.shields.io/badge/APIs-OpenAI%20%7C%20Anthropic-8a63d2">
+<a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
+**English** · [简体中文](README.zh-CN.md)
 
 A local proxy between your AI coding agent and its model API. API keys, tokens, private keys and
 personal data are replaced by placeholders before a request leaves your machine, and put back
@@ -12,10 +20,8 @@ Claude Code · Codex · OpenCode · DeepSeek · any OpenAI- or Anthropic-compati
 
 Local · Zero dependencies · No value ever written to disk
 
-[English](README.md) · [简体中文](README.zh-CN.md)
-
 ```bash
-npx llm-redact
+npx github:zch6a/llm-redact
 ```
 
 </div>
@@ -51,8 +57,8 @@ The model answers with a tool call that writes `OPENAI_API_KEY=[[REDACTED:openai
 ## Quick start
 
 ```bash
-npx llm-redact          # listens on http://127.0.0.1:8787
-npx llm-redact env      # prints what to set for each client, for your shell
+npx github:zch6a/llm-redact          # listens on http://127.0.0.1:8787
+npx github:zch6a/llm-redact env      # prints what to set for each client, for your shell
 ```
 
 Then point your agent at it:
