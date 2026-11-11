@@ -982,9 +982,11 @@ describe('round 5: the fifth review', () => {
     };
     for (const [name, run, n] of [['messages', messages, 2000], ['fields', fields, 1000]] as const) {
       run(n / 4); // warm up
-      const small = Math.min(run(n / 4), run(n / 4));
-      const large = run(n);
-      assert.ok(large < 8 * Math.max(small, 5), `${n} ${name}: ${large.toFixed(0)} ms, ${n / 4}: ${small.toFixed(0)} ms (quadratic would be 16x)`);
+      // Best of three for both sizes: one run on a shared runner can include a pause that has nothing
+      // to do with the code (on macOS, 891 ms once for what is otherwise ~100 ms).
+      const small = Math.min(run(n / 4), run(n / 4), run(n / 4));
+      const large = Math.min(run(n), run(n), run(n));
+      assert.ok(large < 10 * Math.max(small, 5), `${n} ${name}: ${large.toFixed(0)} ms, ${n / 4}: ${small.toFixed(0)} ms (quadratic would be 16x)`);
       assert.ok(large < 20_000, `${n} ${name}: ${large.toFixed(0)} ms`);
     }
   });
