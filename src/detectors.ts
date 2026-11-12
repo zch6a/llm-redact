@@ -24,6 +24,8 @@ export interface Detector {
   validate?: (value: string, match: RegExpExecArray) => boolean;
   /** Removed from the end of the value (trailing punctuation), instead of a lookahead that backtracks. */
   trimEnd?: RegExp;
+  /** Cuts the value where its context says it ends (before trimEnd); `group` is the capture group the value is from. */
+  trim?: (value: string, match: RegExpExecArray, group: number) => string;
   /** Off unless enabled explicitly (too noisy for most code). */
   optional?: boolean;
 }
@@ -137,26 +139,30 @@ const EXAMPLE_EMAIL = /@(example\.(com|org|net)|[\w-]+\.(example|test|invalid|lo
 /** Ordered: earlier detectors win where matches overlap (specific before generic). */
 export const DETECTORS: Detector[] = [
   // ---- private keys and connection strings
-  { id: 'private_key', kind: 'secret', description: 'PEM private key block (also when truncated before its END line)', re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]{20,16000}?-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----|(?:\r?\n[A-Za-z0-9+/=]{4,200}){1,400})/g },
+  { id: 'private_key', kind: 'secret', description: 'PEM private key block (also when truncated before its END line)', re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----(?:(?:(?!-----BEGIN )[\s\S]){20,16000}?-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----|(?:\r?\n[A-Za-z0-9+/=]{4,200}){1,400})/g },
   // ---- provider tokens (fixed prefixes: very low false-positive rate)
   { id: 'anthropic_key', kind: 'secret', description: 'Anthropic API key', re: /\bsk-ant-[A-Za-z0-9_-]{20,200}/g },
   { id: 'openai_key', kind: 'secret', description: 'OpenAI / DeepSeek / compatible API key (sk-…)', re: /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,200}/g, validate: (v) => !v.startsWith('sk-ant-') && looksReal(v.slice(3)) },
   { id: 'github_token', kind: 'secret', description: 'GitHub token', re: /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{60,255})\b/g },
-  { id: 'gitlab_token', kind: 'secret', description: 'GitLab token', re: /\bgl(?:pat|dt|ptt|rt)-[A-Za-z0-9_-]{20,64}\b/g },
+  { id: 'gitlab_token', kind: 'secret', description: 'GitLab token', re: /\bgl(?:pat|dt|ptt|rt)-[A-Za-z0-9_-]{20,64}(?![A-Za-z0-9_-])/g },
   { id: 'aws_access_key', kind: 'secret', description: 'AWS access key id', re: /\b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}\b/g },
   { id: 'aws_secret_key', kind: 'secret', description: 'AWS secret access key (next to its name)', re: /\baws_?secret_?access_?key["']?\s{0,5}[:=]\s{0,5}["']?([A-Za-z0-9/+=]{40})\b/gi, group: 1 },
-  { id: 'google_api_key', kind: 'secret', description: 'Google API key', re: /\bAIza[0-9A-Za-z_-]{35}\b/g },
-  { id: 'slack_token', kind: 'secret', description: 'Slack token', re: /\bxox[abposr]-[A-Za-z0-9-]{10,250}\b/g },
+  { id: 'google_api_key', kind: 'secret', description: 'Google API key', re: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g },
+  { id: 'slack_token', kind: 'secret', description: 'Slack token', re: /\bxox[abposr]-[A-Za-z0-9-]{10,250}(?![A-Za-z0-9-])/g },
   { id: 'slack_webhook', kind: 'secret', description: 'Slack incoming webhook', re: /https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{6,20}\/B[A-Z0-9]{6,20}\/[A-Za-z0-9]{20,40}/g },
   { id: 'discord_webhook', kind: 'secret', description: 'Discord webhook', re: /https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/\d{5,30}\/[A-Za-z0-9_-]{30,100}/g },
   { id: 'stripe_key', kind: 'secret', description: 'Stripe secret / restricted key', re: /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,250}\b/g },
   { id: 'npm_token', kind: 'secret', description: 'npm token', re: /\bnpm_[A-Za-z0-9]{36}\b/g },
   { id: 'huggingface_token', kind: 'secret', description: 'Hugging Face token', re: /\bhf_[A-Za-z0-9]{34,40}\b/g },
-  { id: 'telegram_bot_token', kind: 'secret', description: 'Telegram bot token', re: /\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b/g },
-  { id: 'jwt', kind: 'secret', description: 'JSON Web Token', re: /\beyJ[A-Za-z0-9_-]{10,2000}\.eyJ[A-Za-z0-9_-]{10,4000}\.[A-Za-z0-9_-]{10,2000}/g },
+  { id: 'telegram_bot_token', kind: 'secret', description: 'Telegram bot token', re: /\b\d{8,10}:AA[A-Za-z0-9_-]{33}(?![A-Za-z0-9_-])/g },
+  // Starts only where a run of token characters starts: at every `eyJ` inside one long run (`eyJ-eyJ-…`) the
+  // first segment was scanned up to 2,000 characters again (1 s per megabyte). Same for the key above: a block
+  // ends at the next BEGIN, not 16,000 characters later.
+  { id: 'jwt', kind: 'secret', description: 'JSON Web Token', re: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,2000}\.eyJ[A-Za-z0-9_-]{10,4000}\.[A-Za-z0-9_-]{10,2000}/g },
   // After the provider tokens: a GitHub token used as a URL password keeps its specific label.
-  { id: 'url_password', kind: 'secret', description: 'Password inside a URL (postgres://user:PASSWORD@host)', re: /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@'"`]{1,100}:([^\s@/'"`]{3,200})@[^\s/'"`,;@]{1,200}/gi, group: 1, validate: (v) => !/^\$\{?\w+\}?$|^\*+$|^(password|passwd|pass|pwd|secret|test|testing|postgres|root|admin|user|guest|example|changeme|dev|local|mysql|redis|app)$/i.test(v) && !/^\[\[REDACTED:|^\[?REDACTED\]?$/i.test(v) },
-  { id: 'bearer_token', kind: 'secret', description: 'Bearer token in an Authorization header', re: /\b(?:Authorization|authorization)["']?\s{0,5}[:=]\s{0,5}["']?Bearer\s{1,5}([A-Za-z0-9._~+/=-]{16,2000})/g, group: 1, validate: (v) => looksReal(v) },
+  { id: 'url_password', kind: 'secret', description: 'Password inside a URL (postgres://user:PASSWORD@host)', re: /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@'"`]{0,100}:([^\s@/'"`]{3,200})@[^\s/'"`,;@]{1,200}/gi, group: 1, validate: (v) => !/^\$\{?\w+\}?$|^\*+$|^(password|passwd|pass|pwd|secret|test|testing|postgres|root|admin|user|guest|example|changeme|dev|local|mysql|redis|app)$/i.test(v) && !/^\[\[REDACTED:|^\[?REDACTED\]?$/i.test(v) },
+  // Header names are case-insensitive (`authorization: bearer …` from curl, `AUTHORIZATION:` in logs), and so are schemes.
+  { id: 'bearer_token', kind: 'secret', description: 'Bearer / Token / Basic credentials in an Authorization header', re: /\bauthorization["']?\s{0,5}[:=]\s{0,5}["']?(?:bearer|token|basic)\s{1,5}([A-Za-z0-9._~+/=-]{16,2000})/gi, group: 1, validate: (v) => looksReal(v) },
 
   // ---- generic: NAME=value where the name says secret and the value looks generated
   {
@@ -166,13 +172,40 @@ export const DETECTORS: Detector[] = [
     // The value: quoted (to the closing quote, honouring backslash escapes, so `"a\"b"` is one value)
     // or unquoted (to whitespace: quotes *inside* an unquoted .env value are part of it).
     // `pass` / `pw` only as a word of the name (`db.pass`, `DB_PW`), not inside one (`bypass`, `compass`).
-    re: /\b([A-Za-z0-9_.-]{0,100}(?:secret|token|passwd|password|pwd|(?<![A-Za-z0-9])(?:pass|pw)(?![A-Za-z0-9_])|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}(?:"((?:[^"\\\n]|\\.){8,400})"|'((?:[^'\\\n]|\\.){8,400})'|`([^`\n]{8,400})`|([^\s"'`<>({\[\\;](?:[^\s\\;]|\\(?![nrt])){7,399}))/gi,
+    re: /\b([A-Za-z0-9_.-]{0,100}(?:secret|token|passwd|password|pwd|(?<![A-Za-z0-9])(?:pass|pw)(?![A-Za-z0-9_])|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credential)s?[A-Za-z0-9_]{0,20})["']?\s{0,5}(?:[:=]|=>|:=)\s{0,5}(?:"((?:[^"\\\n]|\\.){8,400})"|'((?:[^'\\\n]|\\.){8,400})'|`([^`\n]{8,400})`|([^\s"'`<>({\[\\;](?:[^\s\\;]|\\(?![nrt])){5,399}))/gi,
     trimEnd: /[,;)}\]]+$/,
+    // An unquoted value inside a quoted string ends with that string: `"DB_PASSWORD=Tr0ub4dor"` in docker inspect
+    // output, `['--password=…', …]`, `cmd = "export X_TOKEN=…"`. The closing quote was kept as part of the value,
+    // so the agent got back a wrong password, and the bare password was not recognised when it came again.
+    trim: (v, m, g) => {
+      if (g !== 5) return v;
+      let i = m.index - 1;
+      while (i >= 0 && /[\w.-]/.test(m.input[i] as string)) i--;
+      const q = m.input[i];
+      if (q === '"' || q === "'" || q === '`') {
+        const k = v.indexOf(q);
+        if (k >= 0) v = v.slice(0, k);
+      }
+      // A closing quote (and what follows it: `",`, `"/>`) with no opening one inside the value.
+      const t = /(["'`])[,;)}\]/>]*$/.exec(v);
+      if (t && t.index !== undefined && v.indexOf(t[1] as string) === t.index) v = v.slice(0, t.index);
+      return v;
+    },
     group: [2, 3, 4, 5],
     validate: (v, m) => {
       const name = (m[1] as string).toLowerCase();
+      // Passwords are often short; generated tokens and keys are not. A 6- or 7-character password cannot reach the
+      // entropy bar of looksReal (too few distinct characters), so it needs three kinds of character instead
+      // (`Tr0ub4!`), and must not be a reference or code.
+      const pw = /(passwd|password|pwd|pass|pw)s?$/.test(name);
+      if (v.length < (pw ? 6 : 8)) return false;
+      if (pw && v.length < 8) {
+        const kinds = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((r) => r.test(v)).length;
+        return kinds >= 3 && !/^[$%<{!/~]/.test(v) && !/[A-Za-z_$][\w$]*(?:\.|::|->|\()/.test(v) && !/^\[\[REDACTED:/.test(v);
+      }
       // Names that say "a count / a place / a kind", not "a credential": max_tokens, token_endpoint, secret_name.
-      if (/(type|length|count|name|file|path|url|uri|endpoint|host|domain|server|base|prefix|header|field|id|limit|budget|usage|ttl|hint|label|format|expir\w*)s?$/.test(name)) return false;
+      // (`*_key_base` is Rails' secret: SECRET_KEY_BASE.)
+      if (/(type|length|count|name|file|path|url|uri|endpoint|host|domain|server|(?<!key_)base|prefix|header|field|id|limit|budget|usage|ttl|hint|label|format|expir\w*)s?$/.test(name)) return false;
       if (/^(max|min|num|n|total|input|output|prompt|completion|cached?|cache_read|cache_creation|remaining|used|reasoning)[_-]?tokens?(_[a-z]+)?$|^tokens$/.test(name)) return false;
       return looksReal(v) && !/^(true|false|null|none|undefined)$/i.test(v);
     },

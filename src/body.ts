@@ -114,7 +114,37 @@ function isObject(v: unknown): v is Record<string, unknown> {
  */
 function isBinary(key: string, s: string): boolean {
   if (s.startsWith('data:')) return /^data:[\w.+/-]{1,100};base64,[A-Za-z0-9+/=\r\n]*$/.test(s);
-  return (key === 'data' || key === 'file_data' || key === 'b64_json') && s.length > 256 && /^[A-Za-z0-9+/=\r\n]+$/.test(s);
+  return (key === 'data' || key === 'file_data' || key === 'b64_json') && s.length > 256 && /^[A-Za-z0-9+/=\r\n]+$/.test(s) && binaryBase64(s) !== false;
+}
+
+/** File signatures of binary formats a request carries (images, PDF, archives, audio, video). */
+const MAGIC: [number, number[]][] = [
+  [0, [0x89, 0x50, 0x4e, 0x47]], [0, [0xff, 0xd8, 0xff]], [0, [0x47, 0x49, 0x46, 0x38]], [0, [0x52, 0x49, 0x46, 0x46]], [0, [0x25, 0x50, 0x44, 0x46]],
+  [0, [0x50, 0x4b, 0x03, 0x04]], [0, [0x1f, 0x8b]], [0, [0x49, 0x44, 0x33]], [0, [0xff, 0xfb]], [0, [0xff, 0xf3]], [0, [0xff, 0xf2]], [0, [0x4f, 0x67, 0x67, 0x53]],
+  [0, [0x66, 0x4c, 0x61, 0x43]], [4, [0x66, 0x74, 0x79, 0x70]], [0, [0x42, 0x4d]], [0, [0x49, 0x49, 0x2a, 0x00]], [0, [0x4d, 0x4d, 0x00, 0x2a]], [0, [0x00, 0x00, 0x01, 0x00]],
+  [0, [0x1a, 0x45, 0xdf, 0xa3]], [0, [0x37, 0x7a, 0xbc, 0xaf]],
+];
+
+/**
+ * Whether a base64-looking string under a data key is binary: `true` for a known binary format, `'text'` when it
+ * decodes to UTF-8 text (decoded, redacted and encoded again), `false` when it is not base64 at all and so is text
+ * to redact as written. Plain text is made of base64 characters too ("AKIAFAKE…1234" lines): skipping every such
+ * string under `data` let an Anthropic text document or a tool argument named `data` through unredacted.
+ */
+function binaryBase64(s: string): boolean | 'text' {
+  const lines = s.replace(/\r/g, '').split('\n').filter((l, i, a) => l !== '' || i < a.length - 1);
+  // Wrapped base64 has lines of one width (60 or more), all but the last; anything else is text.
+  if (lines.length > 1) {
+    const w = (lines[0] as string).length;
+    if (w < 60 || lines.slice(0, -1).some((l) => l.length !== w) || (lines[lines.length - 1] as string).length > w) return false;
+  }
+  const flat = lines.join('');
+  if (flat.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(flat)) return false;
+  const bytes = Buffer.from(flat, 'base64');
+  if (MAGIC.some(([at, sig]) => sig.every((b, i) => bytes[at + i] === b))) return true;
+  const text = bytes.toString('utf8');
+  if (Buffer.from(text, 'utf8').equals(bytes)) return 'text';
+  return false;
 }
 
 export type Visit = (s: string, key: string, free: boolean) => string;
@@ -169,7 +199,16 @@ function envelopeKey(parent: Record<string, unknown>, k: string): string {
 function walk(v: unknown, fn: Visit, key = '', mode: Mode = 'envelope', depth = 0, signed: (o: Record<string, unknown>) => boolean = isSigned): unknown {
   if (depth > MAX_DEPTH) throw new Error(`request nested deeper than ${MAX_DEPTH} levels`);
   if (typeof v === 'string') {
-    if (isBinary(key, v)) return v.startsWith('data:') ? dataUrlText(v, fn) : v;
+    if (isBinary(key, v)) {
+      if (v.startsWith('data:')) return dataUrlText(v, fn);
+      // Base64 of a text file under a data key: decoded, redacted and encoded again (unchanged when nothing was found).
+      if (binaryBase64(v) === 'text') {
+        const flat = v.replace(/[\r\n]/g, '');
+        const r = base64Text(flat, fn);
+        return r === flat ? v : r;
+      }
+      return v;
+    }
     return mode === 'envelope' && STRUCTURAL.has(key) ? v : fn(v, key, mode !== 'envelope');
   }
   const digits = numberText(v);
@@ -189,7 +228,8 @@ function walk(v: unknown, fn: Visit, key = '', mode: Mode = 'envelope', depth = 
       continue;
     }
     // An Anthropic document / file source with a text media type: { type: 'base64', media_type: 'text/plain', data }.
-    if (k === 'data' && typeof x === 'string' && v.type === 'base64' && typeof v.media_type === 'string' && TEXT_MEDIA.test(v.media_type)) {
+    // (Parameters do not change the type: `text/plain; charset=utf-8` is text.)
+    if (k === 'data' && typeof x === 'string' && v.type === 'base64' && typeof v.media_type === 'string' && TEXT_MEDIA.test(v.media_type.split(';')[0]!.trim())) {
       put(out, k, base64Text(x, fn));
       continue;
     }

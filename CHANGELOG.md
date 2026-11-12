@@ -2,6 +2,56 @@
 
 All notable changes are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [1.2.0] — 2026-11-12
+
+An independent review: 11 problems, each reproduced on synthetic data against a mock upstream before it was fixed.
+
+### Security
+- **A password inside a quoted string kept the closing quote.** `["DB_PASSWORD=Tr0ub4dor…", …]` (docker inspect),
+  `cmd = "export DB_PASSWORD=…"`, `['--password=…']`: the value ran to the next space, quote included. The agent got
+  back a wrong password (`Tr0ub4dor…"`), and since the vault remembered the value with its quote, the bare password
+  reached the provider unredacted the next time it came without its name. An unquoted value now ends where the
+  quoted string around it ends.
+- **Missed formats:** URLs with an empty user (`redis://:password@host`, the usual Redis form), Google API keys and
+  Telegram tokens ending in `-` (one in 64), `Authorization` headers in other cases (`authorization: bearer …`,
+  `AUTHORIZATION:`) and with the `Token` and `Basic` schemes, Rails' `SECRET_KEY_BASE`, and passwords of 6 or 7
+  characters (with three kinds of character).
+- **Numeric HTML entities** (`li.wei&#64;corp-mail.cn`, `&#x41;KIA…`) were not decoded unless the text also had a
+  named entity.
+- **Text under a `data` key** (an Anthropic text document, a tool argument named `data`) was skipped whenever it was
+  made only of base64 characters. Only real binary (valid base64 of a known image, PDF, archive, audio or video
+  format) is skipped now; base64 of text is decoded and redacted; anything else is text.
+- **A body that is not UTF-8** with no charset declared (UTF-16 sent as `text/plain`) went through as if it were, so
+  the patterns did not see the key in it. It is refused (415) like a declared foreign charset. A text document
+  whose media type has parameters (`text/plain; charset=utf-8`) is decoded and redacted.
+- `scan --body` and config-file errors quoted a piece of the input (V8's JSON message), which could be the end of a
+  key; they say where the error is instead.
+- `Proxy-Authorization` is no longer forwarded to the provider, and the provider's `Access-Control-*` headers are not
+  passed back.
+
+### Fixed
+- **Slow inputs blocked every agent on the proxy:** the JWT and private-key patterns restarted at every `eyJ` of a
+  long run and every `BEGIN` header (about 1 s per megabyte, 30 s for a 4 MB request while every other request
+  waited). Both start once per run now: under 0.3 s per megabyte, and a small request no longer waits behind a big one.
+- **A client that stopped reading and then disconnected left its handler waiting forever** (no log line, its values
+  kept in memory). The wait ends when the client goes.
+- `--require-token` turned itself off when the token file existed but was empty (and took any text as the token); an
+  invalid token file is replaced with a new token.
+- The startup warning said upstream requests never use `HTTP_PROXY`; with `NODE_USE_ENV_PROXY=1` on Node 24 they do,
+  and it says so. Error messages for `port` and `--max-body` name the value given.
+
+### Added
+- A release workflow: each version tag is tested, packed (the packed CLI is installed and redacts a sample once),
+  and published as a GitHub release with its CHANGELOG section and the installable `.tgz` attached. The job that
+  can write runs nothing of the project.
+
+### Changed
+- CI pins its actions to commits, keeps no token in the checkout and installs without dependency scripts; a test
+  keeps every workflow that way.
+- Every test process runs with the home folder, `APPDATA` and `XDG_CONFIG_HOME` in an empty temp folder and no proxy
+  variables (`test/isolate.ts`), and a test checks that the default key lives there: no test can touch the real key
+  or vault of whoever runs it.
+
 ## [1.1.0] — 2026-11-12
 
 ### Added

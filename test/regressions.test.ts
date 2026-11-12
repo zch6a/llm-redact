@@ -562,9 +562,11 @@ describe('round 3: values restored once are never sent in clear again', () => {
     const q = new Vault(Buffer.alloc(32, 33));
     redactText(`DB_PASSWORD='Qx"7-pL\\2m9z'`, q);
     noLeak(redactText(JSON.stringify({ log: `connected with Qx"7-pL\\2m9z` }), q).text, 'Qx\\"7-pL\\\\2m9z', 'pL');
-    // Short values are not searched for everywhere (they would match ordinary text).
+    // A short password (6-7 characters, three kinds) is a secret too, and so wherever it appears again as a whole
+    // word ("once a secret, always a secret"); never inside a longer word, where it would match ordinary text.
     redactText('PASSWORD=Ab1-x9Q', fresh);
-    assert.equal(redactText('Ab1-x9Q is a SKU', fresh).text, 'Ab1-x9Q is a SKU');
+    noLeak(redactText('Ab1-x9Q is a SKU', fresh).text, 'Ab1-x9Q');
+    assert.equal(redactText('part SKU-Ab1-x9Q9 and xAb1-x9Q', fresh).text, 'part SKU-Ab1-x9Q9 and xAb1-x9Q');
   });
 });
 
@@ -1017,7 +1019,8 @@ describe('round 5: the fifth review', () => {
     const w = new Vault(Buffer.alloc(32, 68));
     const cache = new RedactCache();
     const b64 = Buffer.from('admin:Tr0ub4dor-zq9xK').toString('base64');
-    const text = 'x'.repeat(1100) + ` > Authorization: Basic ${b64}`;
+    // (Not an Authorization header: since 1.2.0 Basic credentials there are redacted on sight.)
+    const text = 'x'.repeat(1100) + ` > X-Creds: ${b64}`;
     assert.ok(redactText(text, w, { cache }).text.includes(b64), 'nothing known yet');
     redactText('DB_PASSWORD=Tr0ub4dor-zq9xK', w, { cache });
     noLeak(redactText(text, w, { cache }).text, b64);

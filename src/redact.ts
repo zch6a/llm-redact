@@ -204,6 +204,7 @@ export function findValues(text: string, detectors: Detector[], allow: Set<strin
       if (!value) continue;
       // Exact position of the value from the regex engine (never a string search: the value can repeat in the match).
       const start = (m.indices?.[g]?.[0] ?? m.index) as number;
+      if (d.trim) value = d.trim(value, m, g);
       if (d.trimEnd) value = value.replace(d.trimEnd, '');
       if (!value) continue;
       const end = start + value.length;
@@ -235,7 +236,8 @@ const DECODERS: { name: string; test: RegExp; re: RegExp; decode: (m: RegExpExec
   { name: 'json', test: /\\["\\/bfnrtu]/, re: JSON_ESCAPE, decode: (m) => ((m[1] as string).length === 5 ? String.fromCharCode(parseInt((m[1] as string).slice(1), 16)) : (JSON_CHAR[m[1] as string] ?? (m[1] as string))) },
   {
     name: 'html',
-    test: /&(?:quot|amp|apos|lt|gt|#\d|#[xX][0-9a-fA-F]);/,
+    // The same entities the decoder reads: `&#\d;` (one digit) let `&#64;` and `&#x40;` through undecoded.
+    test: /&(?:quot|amp|apos|lt|gt|#\d{1,7}|#[xX][0-9a-fA-F]{1,6});/,
     re: HTML_ENTITY,
     decode: (m) => {
       if (m[1]) return HTML_CHAR[m[1]] as string;

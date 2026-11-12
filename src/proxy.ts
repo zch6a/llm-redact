@@ -13,7 +13,6 @@
  * bodies or values.
  */
 import { timingSafeEqual } from 'node:crypto';
-import { once } from 'node:events';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from 'node:zlib';
 import { apiFor, parseJson, redactForm, redactRequest, restoreResponse } from './body.ts';
@@ -53,7 +52,10 @@ export interface ProxyStats {
   redacted: Record<string, number>;
 }
 
-const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'content-encoding', 'accept-encoding', 'expect']);
+// (Proxy-Authorization is for the hop it is sent to, this proxy: never forwarded to the provider.)
+const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'content-encoding', 'accept-encoding', 'expect']);
+/** Response headers never passed back: requests from other origins are refused here, so the provider's CORS answer means nothing. */
+const RESPONSE_DROP = /^access-control-/i;
 const LOOPBACK_ORIGIN = /^https?:\/\/(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?$/i;
 const LOOPBACK_HOST = /^(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?$/i;
 
@@ -186,9 +188,13 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
         const plain = decompress(raw, req.headers['content-encoding'], maxBody);
         const type = (req.headers['content-type'] ?? '').toLowerCase();
         // Patterns match UTF-8 text; a body in another charset would pass them by unseen.
-        const charset = /;\s*charset="?([^";\s]+)/.exec(type)?.[1];
-        const foreign = !!charset && !/^(utf-?8|us-ascii|ascii)$/.test(charset);
+        const declared = /;\s*charset="?([^";\s]+)/.exec(type)?.[1];
         let text = plain.toString('utf8');
+        // Undeclared is not "UTF-8" either: a UTF-16 body sent as text/plain went through as if it were, with the
+        // key readable to anyone who drops the NUL bytes. Text that does not round-trip as UTF-8 is refused too.
+        const notUtf8 = !declared && plain.length > 0 && (plain.includes(0) || !Buffer.from(text, 'utf8').equals(plain));
+        const charset = declared ?? (notUtf8 ? 'non-UTF-8 (undeclared)' : undefined);
+        const foreign = notUtf8 || (!!declared && !/^(utf-?8|us-ascii|ascii)$/.test(declared));
         if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // a BOM is not a reason to skip redaction
         if (!plain.length) body = plain;
         else if (foreign) {
@@ -249,7 +255,7 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
 
     const outHeaders: Record<string, string | string[]> = {};
     upstream.headers.forEach((v, k) => {
-      if (!HOP.has(k.toLowerCase())) outHeaders[k] = v;
+      if (!HOP.has(k.toLowerCase()) && !RESPONSE_DROP.test(k)) outHeaders[k] = v;
     });
     // Every Set-Cookie, not only the last (Headers joins the others away).
     const cookies = upstream.headers.getSetCookie();
@@ -275,8 +281,27 @@ export function createProxy(opts: ProxyOptions): Server & { stats: ProxyStats } 
     let outcome: string | undefined;
     let responseId: string | undefined;
     /** Write, waiting when the client reads slower than the upstream sends (no unbounded buffering). */
+    // A client that stops reading and then disconnects never sends 'drain': waiting for it alone left the handler
+    // stuck for good (no log line, its pinned values kept in memory). Its 'close' ends the wait as an abort.
     const write = async (s: string | Uint8Array): Promise<void> => {
-      if (s.length && !res.write(s)) await once(res, 'drain');
+      if (!s.length || res.write(s)) return;
+      if (res.destroyed) throw Object.assign(new Error('the client went away'), { name: 'AbortError' });
+      await new Promise<void>((resolve, reject) => {
+        const off = () => {
+          res.off('drain', drained);
+          res.off('close', closed);
+        };
+        const drained = () => {
+          off();
+          resolve();
+        };
+        const closed = () => {
+          off();
+          reject(Object.assign(new Error('the client went away'), { name: 'AbortError' }));
+        };
+        res.once('drain', drained);
+        res.once('close', closed);
+      });
     };
     try {
       if (req.method === 'HEAD' || !upstream.body || undecoded) {

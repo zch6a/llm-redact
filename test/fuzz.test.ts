@@ -12,7 +12,7 @@ import { NdjsonRestorer, SseParser, SseRestorer, serialize, type Event } from '.
 import { Vault } from '../src/vault.ts';
 
 const v = new Vault(Buffer.alloc(32, 21));
-const VALUES = ['sk-proj-' + 'B'.repeat(40), 'p"a\\ss\nwé d\u{1F600}', 'a\tb\u0000c', '[[REDACTED:x:00000000]]-ish'];
+const VALUES = ['sk-proj-' + 'B'.repeat(40), 'p"a\\ss\nwé\u2028d\u{1F600}', 'a\tb\u0000c', '[[REDACTED:x:00000000]]-ish'];
 const PHS = VALUES.map((x, i) => v.placeholderFor(`lab_${i}`, x));
 const PIECES = ['hello ', 'a[i] ', '[[wiki]] ', '[[RED', '[[REDACTED:', '[', '[[', ']]', 'x', 'é', '\u{1F600}', '\n', '"', '\\', '[[REDACTED:lab_0:deadbeef]]', ...PHS, ...PHS];
 

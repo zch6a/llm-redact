@@ -95,6 +95,19 @@ interface Config {
   redact: RedactOptions & { note?: boolean };
 }
 
+/**
+ * Where a JSON parse failed, without the text around it: V8's message quotes a piece of the input
+ * (`..."defFAKE"},]}" is not valid JSON`), which may be the end of a key, and this output is read by people and,
+ * through the Agent Skill, by the model.
+ */
+export function jsonErrorPlace(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/nested deeper/.test(msg)) return ` (${msg})`;
+  const at = /position (\d+)(?: \(line (\d+) column (\d+)\))?/.exec(msg);
+  if (at) return at[2] ? ` (line ${at[2]}, column ${at[3]})` : ` (at character ${at[1]})`;
+  return /end of JSON input/.test(msg) ? ' (it ends too early)' : '';
+}
+
 const list = (v: string[] | undefined) => (v ?? []).flatMap((s) => s.split(',')).map((s) => s.trim()).filter(Boolean);
 
 /** The access token for --require-token: random, created once, next to the HMAC key. */
@@ -108,8 +121,17 @@ function loadToken(): string {
   }
   const t = randomBytes(16).toString('hex');
   const r = writePrivate(file, t + '\n', true);
-  // Another proxy created it at the same moment: both must use the same token.
-  if (r === 'exists') return readFileSync(file, 'utf8').trim();
+  if (r === 'exists') {
+    // Another proxy created it at the same moment: both must use the same token. But an existing file that holds
+    // no token (empty, whitespace, anything but 32 hex digits) is replaced: read back as the token, an empty one
+    // turned --require-token off without a word.
+    const existing = readFileSync(file, 'utf8').trim();
+    if (/^[0-9a-f]{32}$/.test(existing)) return existing;
+    if (writePrivate(file, t + '\n') === false) console.error(`llm-redact: warning: could not make ${file} readable by you only (icacls failed)`);
+    const now = readFileSync(file, 'utf8').trim();
+    if (!/^[0-9a-f]{32}$/.test(now)) throw new UsageError(`${file} holds no valid token and could not be replaced; delete it and start again`);
+    return now;
+  }
   if (!r) console.error(`llm-redact: warning: could not make ${file} readable by you only (icacls failed)`);
   return t;
 }
@@ -143,7 +165,7 @@ export function readConfigFile(file: string, explicit: boolean): Record<string, 
   try {
     cfg = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
   } catch (err) {
-    throw new UsageError(`${file} is not valid JSON (${(err as Error).message}); fix or remove it`);
+    throw new UsageError(`${file} is not valid JSON${jsonErrorPlace(err)}; fix or remove it`);
   }
   if (typeof cfg !== 'object' || cfg === null || Array.isArray(cfg)) throw new UsageError(`${file} must hold a JSON object`);
   for (const [k, x] of Object.entries(cfg)) {
@@ -176,10 +198,10 @@ export function loadConfig(v: Values): Config {
   const enable = [...strs(fileCfg.enable), ...list(v.enable)];
   for (const id of [...disable, ...enable]) if (!known.has(id)) throw new UsageError(`unknown detector "${id}"${didYouMean(id, [...known])} (see: llm-redact detectors)`);
   const port = Number(v.port ?? fileCfg.port ?? 8787);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`bad port ${v.port}`);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`bad port ${v.port ?? fileCfg.port} (1-65535)`);
   const requireToken = !!v['require-token'] || fileCfg.requireToken === true;
   const maxBodyMb = v['max-body'] !== undefined ? Number(v['max-body']) : ((fileCfg.maxBody as number | undefined) ?? 64);
-  if (!(maxBodyMb > 0 && maxBodyMb <= 4096)) throw new UsageError(`--max-body wants megabytes between 1 and 4096, got ${v['max-body']}`);
+  if (!(maxBodyMb > 0 && maxBodyMb <= 4096)) throw new UsageError(`--max-body wants megabytes, more than 0 and at most 4096 (0.5 is half a megabyte), got ${v['max-body'] ?? fileCfg.maxBody}`);
   return { port, upstreams, maxBody: Math.round(maxBodyMb * 1024 * 1024), allowUnredacted: !!v['allow-unredacted'] || fileCfg.allowUnredacted === true, ...(requireToken ? { token: loadToken() } : {}), redact: { disable, enable, allow: [...strs(fileCfg.allow), ...(v.allow ?? [])], note: v['no-note'] ? false : fileCfg.note !== false } };
 }
 
@@ -205,7 +227,10 @@ function cmdStart(v: Values): Promise<number> {
       if (cfg.redact.allow?.length) weak.push(`${cfg.redact.allow.length} value(s) never redacted (--allow / config)`);
       // Node's fetch does not use HTTP(S)_PROXY: upstream connections go direct.
       const outbound = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy;
-      if (outbound) weak.push(`HTTPS_PROXY / HTTP_PROXY is set, but llm-redact connects to the upstreams directly (Node's fetch does not use those variables). If the provider is only reachable through that proxy, requests will fail with 502.`);
+      // Unless NODE_USE_ENV_PROXY is on (Node 24): then fetch does go through it, and the warning must say so.
+      const envProxy = /^(1|true)$/i.test(process.env.NODE_USE_ENV_PROXY ?? '');
+      if (outbound && envProxy) weak.push(`NODE_USE_ENV_PROXY is set: requests to the upstreams go through ${outbound} (already redacted; that proxy sees them as the provider does).`);
+      else if (outbound) weak.push(`HTTPS_PROXY / HTTP_PROXY is set, but llm-redact connects to the upstreams directly (Node's fetch does not use those variables). If the provider is only reachable through that proxy, requests will fail with 502.`);
       for (const w of weak) console.error(`llm-redact: warning: ${w}`);
       console.log(`Run \`llm-redact env\` to see what to set in your agent. Ctrl+C to stop.`);
     });
@@ -332,7 +357,7 @@ function cmdScanBody(v: Values, text: string, cfg: Config): number {
   try {
     body = parseJson(text);
   } catch (err) {
-    console.error(`Not a JSON request body: ${(err as Error).message}`);
+    console.error(`Not a JSON request body${jsonErrorPlace(err)}.`);
     return 1;
   }
   const api = (v.api as Api | undefined) ?? guessApi(body);

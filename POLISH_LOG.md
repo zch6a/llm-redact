@@ -138,3 +138,41 @@ Done then: `src/detectors.ts`, `src/vault.ts`, `src/redact.ts`, `src/stream.ts`;
 - Recall cost after a restart (5,000 pending hashes: +280 ms on a cold 2 MB request): a length index of remembered values would cut the hashing.
 - Letters-only random tokens (1 in 13 missed by the generic rule): a better identifier test that keeps real identifiers apart.
 - The real run with the user's own Claude Code setup (needs their go-ahead: it spends tokens).
+
+## Cycle 2, round 1 — 1.2.0 (2026-11-12)
+
+The second cycle starts with an independent review, as for the other tools: someone who had not written it, on
+synthetic data, with a mock upstream on 127.0.0.1, every home and config folder in a temp directory and the proxy
+variables unset. It confirmed 11 problems by running them; I ran its scripts again against this working copy before
+fixing anything, and after.
+
+- **The leak.** A `NAME=value` inside a quoted string (`["DB_PASSWORD=…", …]` from docker inspect, `cmd = "export
+  X=…"`, `['--password=…']`) kept its closing quote as part of the value: the agent got a wrong password back, and the
+  vault remembered `value"`, so the bare password went out unredacted the next time it came without its name — the
+  "once a secret, always a secret" promise failed exactly where it matters. The detector now cuts an unquoted value
+  at the end of the quoted string around it (a small `trim` hook next to `trimEnd`).
+- **Missed formats:** `redis://:password@host` (an empty user), keys and tokens ending in `-` (a fixed length then
+  `\b`), `authorization: bearer` in other cases and the `Token`/`Basic` schemes, Rails' `SECRET_KEY_BASE` (the name
+  rule rejected names ending in `base`), numeric HTML entities (the pre-check wanted one digit), 6–7 character
+  passwords (they can never reach the entropy bar: three kinds of character instead).
+- **Skipped as binary:** any base64-looking string under `data`/`file_data`/`b64_json`, which plain text often is.
+  Now only real binary (valid base64 with a known file signature) is skipped; base64 of UTF-8 text is decoded,
+  redacted and encoded again; the rest is text.
+- **Forwarded unseen:** an undeclared non-UTF-8 body (UTF-16 as `text/plain`) — refused now — and a text document
+  whose media type has parameters.
+- **The proxy:** two patterns restarted at every position of a long run (1 s per MB; a 4 MB request held up every
+  other agent for 30 s) — now under 0.3 s per MB, and the worst all-encodings case went from about 28 s to 5 s for
+  4 MB; a client that stopped reading and disconnected left a handler waiting for `drain` forever; an empty token
+  file turned `--require-token` off; `Proxy-Authorization` was forwarded and the provider's CORS headers passed back.
+- **Output:** JSON parse errors quoted the input (possibly the end of a key) in `scan --body` and config errors; the
+  startup warning about `HTTP_PROXY` was wrong under `NODE_USE_ENV_PROXY=1`.
+- Two tests encoded the old behaviour and changed with it: a 7-character password was "not a secret" (now it is,
+  and found again as a whole word, never inside a longer one), and a test used an `Authorization: Basic` header as
+  text nothing recognised (Basic credentials are redacted on sight now, so it uses another header).
+- Kept as documented limits: base64 wrapped at 76 columns (only the line with the key's prefix is caught), a
+  passphrase of ordinary words, URL query strings (Gemini's API key travels there and must reach Google).
+- **Engineering:** tests isolated from the real key and vault, with proxy variables cleared (`test/isolate.ts`); CI
+  actions pinned to commits, no token in the checkout, no dependency scripts; a release workflow that packs, installs
+  and runs the package (it must redact a sample) and attaches it.
+
+Tests: 255 (was 242), the review's findings in `test/review2.test.ts`.
