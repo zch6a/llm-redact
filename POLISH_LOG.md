@@ -123,6 +123,14 @@ Done then: `src/detectors.ts`, `src/vault.ts`, `src/redact.ts`, `src/stream.ts`;
 
 235 tests (was 222). **First cycle complete for llm-redact: 5/5.**
 
+## Inserted task — Agent Skill and presentation (v1.1.0)
+
+- [x] **Agent Skill + Claude Code plugin** (`plugin/skills/llm-redact/SKILL.md`, a marketplace in the repository itself; `claude plugin validate` passes for both). The point for an assistant is not the proxy but `scan`: read a `.env`, config or log through `llm-redact scan` and only placeholders enter the conversation, even with no proxy running. `scan --json` answers "is there a secret in it?" with positions and kinds, never values. Setting up the proxy changes how the user's agent connects, so the skill has the assistant explain and ask first, and leave the long-running `start` to the user's own terminal.
+- [x] **`test/skill.test.ts`**: the frontmatter (portable fields, limits), plugin and marketplace agree with the package version, every command in the skill's bash blocks run in order on synthetic secrets in a temp folder with its own config dirs, and none of the secrets appears in any output; the summary line the skill quotes is what `scan` prints; every client × shell the skill names is accepted by `env` (4 × 5 runs).
+- [x] **README** (both languages): an "Ask your AI assistant" section. **Social preview** (`docs/social-preview.png`, from `scripts/social-card.html`): the example `.env` on your machine against what the provider receives. **Launch kit**: `launch/llm-redact.md` outside the repository (drafts; posting is the user's).
+
+239 tests (was 235).
+
 ## Next cycle (after #4–#12)
 
 - Codex with a ChatGPT login (`requires_openai_auth`, upstream `chatgpt.com/backend-api/codex`) — needs a real login to verify.

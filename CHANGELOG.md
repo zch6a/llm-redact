@@ -2,6 +2,17 @@
 
 All notable changes are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [1.1.0] — 2026-11-12
+
+### Added
+
+- **An Agent Skill and a Claude Code plugin** (`/plugin marketplace add zch6a/llm-redact`). The skill has an AI
+  assistant read files likely to hold secrets (`.env`, configs, logs) through `llm-redact scan`, so it works with
+  placeholders and the real values never enter the conversation, even without the proxy; answer "does this file hold
+  secrets?" from `scan --json` (positions and kinds, never values); and explain the proxy and ask before changing how
+  the user's agent connects. A test runs every command the skill gives on synthetic secrets and checks that none of
+  them reaches the output, and that the clients and shells it names are the ones `env` accepts.
+
 ## [1.0.0] — 2026-11-11
 
 The first stable release. A fifth independent review asked one question — would you trust this with your keys? — and answered "after these fixes". They are all in, each with a test, and every fix was undone once in a copy of the code to make sure the suite fails without it (21 mutations, all caught). What 1.x keeps stable is written down in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).

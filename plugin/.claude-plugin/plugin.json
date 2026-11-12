@@ -1,0 +1,10 @@
+{
+  "name": "llm-redact",
+  "description": "Keep API keys, passwords, tokens and personal data out of AI requests: read sensitive files with secrets replaced by placeholders, and redact an agent's requests through a local proxy.",
+  "version": "1.1.0",
+  "author": { "name": "zch6a" },
+  "homepage": "https://github.com/zch6a/llm-redact",
+  "repository": "https://github.com/zch6a/llm-redact",
+  "license": "MIT",
+  "keywords": ["privacy", "secrets", "redaction", "proxy", "claude-code"]
+}

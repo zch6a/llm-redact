@@ -1,0 +1,45 @@
+<!doctype html>
+<!-- The repository's social preview (1280×640): docs/social-preview.png, rendered from this page with headless Chrome
+     (chrome --headless --screenshot --window-size=1280,640). Both panels are docs/example.env.txt (the key shortened) and its real output from
+     `llm-redact scan docs/example.env.txt`. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 1280px; height: 640px; overflow: hidden; }
+  body { background: radial-gradient(1100px 700px at 12% 8%, #13283a 0%, #10141b 55%, #0c0e12 100%); color: #e8e6e3;
+    font-family: "Segoe UI", -apple-system, system-ui, sans-serif; display: grid; grid-template-columns: 500px 1fr; gap: 44px;
+    padding: 0 64px 0 72px; box-sizing: border-box; align-items: center; }
+  h1 { font-size: 72px; margin: 0 0 18px; letter-spacing: -1.5px; }
+  h1 span { color: #56d4b0; }
+  .tag { font-size: 33px; line-height: 1.25; margin: 0 0 26px; font-weight: 600; }
+  .sub { font-size: 20px; line-height: 1.45; color: #b3b8bf; margin: 0 0 32px; }
+  .cmd { font: 22px Consolas, ui-monospace, monospace; background: #1b2028; border: 1px solid #323946; border-radius: 10px; padding: 14px 18px; display: inline-block; color: #fff; }
+  .cmd b { color: #56d4b0; font-weight: 400; }
+  .right { align-self: center; display: grid; gap: 18px; }
+  .panel { background: #13161b; border: 1px solid #2a2f38; border-radius: 14px; padding: 14px 20px 16px; font: 16.5px/1.6 Consolas, ui-monospace, monospace; white-space: pre; box-shadow: 0 26px 70px rgba(0,0,0,.42); }
+  .label { font: 600 14px "Segoe UI", system-ui, sans-serif; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 6px; }
+  .you .label { color: #f0a35e; } .them .label { color: #56d4b0; }
+  .k { color: #8fb8de; } .v { color: #ffb38a; } .r { color: #56d4b0; } .d { color: #8b949e; }
+  .arrow { text-align: center; font: 15px "Segoe UI", system-ui, sans-serif; color: #8b949e; }
+  .arrow b { color: #e8e6e3; font-weight: 600; }
+</style>
+</head>
+<body>
+  <div>
+    <h1>llm<span>-</span>redact</h1>
+    <p class="tag">Your agent keeps the real key.<br>The model provider never sees it.</p>
+    <p class="sub">A local proxy for Claude Code, Codex and any OpenAI- or Anthropic-compatible client. Keys, tokens and personal data become placeholders on the way out, and real values again on the way back.</p>
+    <div class="cmd"><b>$</b> npx github:zch6a/llm-redact</div>
+  </div>
+  <div class="right">
+    <div class="panel you"><div class="label">On your machine</div><span class="k">OPENAI_API_KEY</span>=<span class="v">sk-proj-Qw3rTy…Jk8l</span>
+<span class="k">DATABASE_URL</span>=postgres://app:<span class="v">Xq7-mZ2pL9vT</span>@db.internal:5432/prod
+<span class="k">MAX_TOKENS</span>=4096</div>
+    <div class="arrow">▼ &nbsp;<b>llm-redact</b> &nbsp;·&nbsp; placeholders out, real values back ▲</div>
+    <div class="panel them"><div class="label">What the provider receives</div><span class="k">OPENAI_API_KEY</span>=<span class="r">[[REDACTED:openai_key:a3aec50a]]</span>
+<span class="k">DATABASE_URL</span>=postgres://app:<span class="r">[[REDACTED:url_password:1e808a61]]</span>@db…
+<span class="k">MAX_TOKENS</span>=4096   <span class="d"># not a secret: left alone</span></div>
+  </div>
+</body>
+</html>

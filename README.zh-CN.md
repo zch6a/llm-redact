@@ -77,6 +77,17 @@ npx github:zch6a/llm-redact env      # 按你的 shell 打印每个客户端要�
 
 已用真实的 **Claude Code 2.1** 和 **Codex 0.131** 命令行做过端到端测试（`npm run smoke`，对接本地 mock，不消耗 token）：各自发送一个合成的 key 和邮箱，mock 只看到占位符，命令行打印出真实值；把占位符和说明还原后，经代理的请求与直连时逐字节相同。
 
+## 直接问 AI 助手
+
+llm-redact 自带一个 Agent Skill（技能）。在 Claude Code 里：
+
+```text
+/plugin marketplace add zch6a/llm-redact
+/plugin install llm-redact@llm-redact
+```
+
+然后问它“这个 `.env` 里有没有密钥？”或者“读一下部署日志，告诉我为什么失败”。技能会让助手用 `llm-redact scan` 去读可能含密钥的文件，它看到的只是占位符，真实的值根本不会进入对话——即使代理没有在运行。问它“帮我给 Agent 的请求脱敏”，它会先讲清楚代理是怎么回事，再打印出适合你的 shell 的设置；不经你同意什么都不改。从文件夹读取技能的其他助手：把 [`plugin/skills/llm-redact`](plugin/skills/llm-redact/SKILL.md) 复制到它们的技能文件夹。
+
 ## 能识别什么
 
 | 密钥 | 个人信息 |

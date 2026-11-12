@@ -1,0 +1,12 @@
+{
+  "name": "llm-redact",
+  "description": "llm-redact for Claude Code: keep secrets out of AI requests.",
+  "owner": { "name": "zch6a" },
+  "plugins": [
+    {
+      "name": "llm-redact",
+      "source": "./plugin",
+      "description": "Read sensitive files with secrets replaced by placeholders; redact an agent's requests through a local proxy."
+    }
+  ]
+}

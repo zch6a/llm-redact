@@ -79,6 +79,21 @@ Your API key travels in headers, untouched — the provider needs it. Only reque
 
 Tested end to end with the real **Claude Code 2.1** and **Codex 0.131** CLIs (`npm run smoke`, against a local mock: no tokens spent). Each sends a synthetic key and e-mail; the mock sees only placeholders, the CLI prints the real values, and the proxied request is byte-for-byte what the CLI sent directly once placeholders and the note are undone.
 
+## Ask your AI assistant
+
+llm-redact comes with an Agent Skill. In Claude Code:
+
+```text
+/plugin marketplace add zch6a/llm-redact
+/plugin install llm-redact@llm-redact
+```
+
+Then ask "is there anything secret in this `.env`?" or "read the deploy log and tell me why it fails". The skill has the
+assistant read files likely to hold secrets through `llm-redact scan`, so it works with placeholders and the real values
+never enter the conversation, even without the proxy running. Ask "redact my agent's requests" and it explains the
+proxy and prints what to set for your shell; it changes nothing without asking. Assistants that read Agent Skills from
+a folder: copy [`plugin/skills/llm-redact`](plugin/skills/llm-redact/SKILL.md) into theirs.
+
 ## What is detected
 
 | Secrets | Personal data |
