@@ -3,6 +3,7 @@
  * Responses; streamed and not). The two invariants: the upstream never sees a real value, and
  * the client always gets it back — in text, in tool-call arguments, however the stream is split.
  */
+import './isolate.ts';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';

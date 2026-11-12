@@ -5,6 +5,7 @@
  * would give with the placeholders replaced: the same text, valid JSON in tool arguments, nothing
  * held back at the end. Seeded, so a failure names its case and can be replayed.
  */
+import './isolate.ts';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { NdjsonRestorer, SseParser, SseRestorer, serialize, type Event } from '../src/sse.ts';

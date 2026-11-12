@@ -1,6 +1,7 @@
 // The Agent Skill (plugin/skills/llm-redact/SKILL.md) and the Claude Code plugin around it: the format, and that
 // every command the skill gives an AI works and keeps the secret out of what it prints. Synthetic values only, in a
 // temporary folder with its own config dirs.
+import './isolate.ts';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';

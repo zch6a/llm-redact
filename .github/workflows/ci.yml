@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only: tests need no write access.
 permissions:
   contents: read
 
@@ -18,16 +19,18 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         node: ['22', '24']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
-      - run: npm ci
+      # No install scripts from dependencies; the build is run explicitly.
+      - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: npm test
       - name: Tests without JSON.rawJSON (the fallback path)
-        run: node --import ./test/fixtures/no-rawjson.mjs --test "test/**/*.test.ts"
+        run: node --import ./test/isolate.ts --import ./test/fixtures/no-rawjson.mjs --test "test/**/*.test.ts"
       - run: npm run build
       - name: The built CLI runs
         run: node dist/bin.js detectors && node dist/bin.js env --shell bash
@@ -38,13 +41,14 @@ jobs:
     name: Built package on Node 22.15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-          cache: npm
-      - run: npm ci && npm run build
-      - uses: actions/setup-node@v4
+      - run: npm ci --ignore-scripts && npm run build
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22.15.0'
       - name: The built CLI redacts on 22.15

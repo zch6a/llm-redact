@@ -46,7 +46,7 @@
     "build": "tsc -p tsconfig.json",
     "prepare": "npm run build",
     "dev": "node src/bin.ts",
-    "test": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "test": "node --import ./test/isolate.ts --test --test-reporter=spec \"test/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.check.json",
     "check": "npm run typecheck && npm test",
     "smoke": "node scripts/smoke.ts",

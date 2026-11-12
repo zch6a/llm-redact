@@ -2,6 +2,7 @@
  * Regression tests for the round-1 leak review: every finding gets a test that failed before its
  * fix. All values are synthetic.
  */
+import './isolate.ts';
 import assert from 'node:assert/strict';
 import { createServer, request, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
